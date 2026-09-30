@@ -5,6 +5,8 @@ import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from xgboost import XGBRegressor
 
+from kern.data.features import build_features
+
 ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = ROOT / "data"
 MODEL_DIR = ROOT / "models"

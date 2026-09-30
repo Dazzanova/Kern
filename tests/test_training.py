@@ -1,7 +1,8 @@
 import numpy as np
 
 from kern.data.generate import generate_dataset
-from kern.training.train import build_features, train_model
+from kern.data.features import build_features
+from kern.training.train import train_model
 
 
 def test_feature_columns():
