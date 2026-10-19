@@ -1,6 +1,5 @@
 import pandas as pd
 
-
 REFERENCE_TIME = pd.Timestamp("2025-01-01")
 
 FEATURE_COLUMNS = [

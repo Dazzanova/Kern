@@ -1,7 +1,7 @@
 import numpy as np
 
-from kern.data.generate import generate_dataset
 from kern.data.features import build_features
+from kern.data.generate import generate_dataset
 from kern.training.train import train_model
 
 

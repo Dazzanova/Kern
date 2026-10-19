@@ -4,13 +4,13 @@ from pathlib import Path
 from time import perf_counter
 from uuid import uuid4
 
+import numpy as np
 import pandas as pd
 from fastapi import FastAPI, Request
 from pydantic import BaseModel, Field
 from xgboost import XGBRegressor
 
 from kern.data.features import build_features
-
 
 ROOT = Path(__file__).resolve().parents[3]
 MODEL_PATH = ROOT / "models" / "baseline.json"
@@ -27,6 +27,18 @@ class PredictionResponse(BaseModel):
     model_version: str
     prediction_mw: float
     inference_latency_ms: float
+
+
+class BatchPredictionRequest(BaseModel):
+    records: list[PredictionRequest] = Field(..., min_length=1, max_length=256)
+
+
+class BatchPredictionResponse(BaseModel):
+    request_id: str
+    model_version: str
+    batch_size: int
+    total_processing_time_ms: float
+    predictions: list[float]
 
 
 def load_model() -> XGBRegressor:
@@ -62,15 +74,7 @@ def ready(request: Request):
 def predict(payload: PredictionRequest, request: Request):
     request_id = str(uuid4())
 
-    input_df = pd.DataFrame(
-        [
-            {
-                "timestamp": payload.timestamp,
-                "temperature_c": payload.temperature_c,
-                "humidity_pct": payload.humidity_pct,
-            }
-        ]
-    )
+    input_df = pd.DataFrame([payload.model_dump()])
 
     features = build_features(input_df)
 
@@ -83,4 +87,32 @@ def predict(payload: PredictionRequest, request: Request):
         model_version="baseline",
         prediction_mw=float(prediction),
         inference_latency_ms=latency_ms,
+    )
+
+
+@app.post("/predict/batch", response_model=BatchPredictionResponse)
+def predict_batch(payload: BatchPredictionRequest, request: Request):
+    request_id = str(uuid4())
+    start = perf_counter()
+
+    # Convert records to DataFrame efficiently
+    input_df = pd.DataFrame([r.model_dump() for r in payload.records])
+
+    # Vectorized feature engineering
+    features = build_features(input_df)
+
+    # Single model call for the whole batch
+    predictions = request.app.state.model.predict(features)
+
+    # Ensure predictions are finite
+    predictions = np.nan_to_num(predictions, nan=0.0, posinf=0.0, neginf=0.0)
+
+    processing_time_ms = (perf_counter() - start) * 1000
+
+    return BatchPredictionResponse(
+        request_id=request_id,
+        model_version="baseline",
+        batch_size=len(payload.records),
+        total_processing_time_ms=processing_time_ms,
+        predictions=[float(p) for p in predictions],
     )
