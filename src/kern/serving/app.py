@@ -3,7 +3,7 @@ import math
 import secrets
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from time import perf_counter
 from uuid import uuid4
 
@@ -14,18 +14,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from xgboost import XGBRegressor
 
+from kern import evaluation, reports
 from kern.config import get_settings
 from kern.data.features import build_features
-from kern.drift import (
-    TIME_DERIVED_FEATURES,
-    ks,
-    ks_status,
-    overall_status,
-    psi,
-    psi_status,
-)
-from kern.performance import summarize_performance
-from kern.quality import evaluate_features
 from kern.registry import (
     ModelNotFound,
     RegistryError,
@@ -43,6 +34,7 @@ from kern.telemetry import (
     TelemetryWriter,
     summarize,
 )
+from kern.windows import parse_window
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +93,7 @@ class ModelState:
 async def lifespan(app: FastAPI):
     settings = get_settings()
     pool = None
+    runner = None
     try:
         pool = create_pool(settings.database_url)
         apply_migrations(pool)
@@ -128,7 +121,12 @@ async def lifespan(app: FastAPI):
         )
         app.state.recorder = recorder
         app.state.writer = writer
+        app.state.last_retention = None
         writer.start()
+
+        if settings.evaluation_interval > 0:
+            runner = evaluation.EvaluationRunner(app)
+            runner.start()
 
         if not settings.api_token:
             logger.warning(
@@ -146,6 +144,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if runner is not None:
+            runner.stop()
         writer.stop()
         pool.close()
 
@@ -315,31 +315,6 @@ def predict_batch(payload: BatchPredictionRequest, request: Request):
     )
 
 
-_WINDOW_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-MAX_WINDOW = timedelta(days=365)
-
-
-def parse_window(value: str) -> timedelta:
-    unit = value[-1:]
-    amount = value[:-1]
-    # Bound the digit count before int()/timedelta arithmetic: an absurdly long
-    # amount would otherwise overflow C-level arithmetic and surface as a 500.
-    if (
-        unit not in _WINDOW_UNITS
-        or not amount.isdigit()
-        or len(amount) > 6
-        or int(amount) == 0
-    ):
-        raise ValueError(f"invalid window: {value!r}")
-    try:
-        delta = timedelta(seconds=int(amount) * _WINDOW_UNITS[unit])
-    except OverflowError as error:
-        raise ValueError(f"invalid window: {value!r}") from error
-    if delta > MAX_WINDOW:
-        raise ValueError(f"window exceeds {MAX_WINDOW.days} days")
-    return delta
-
-
 @app.get("/models")
 def models(request: Request):
     versions = list_versions(request.app.state.pool)
@@ -487,25 +462,12 @@ def performance_report(request: Request, window: str = "24h"):
     except (ValueError, OverflowError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
-    since = datetime.now(timezone.utc) - delta
-    state = request.app.state
-    current = state.current
-
-    with state.pool.connection() as conn:
-        rows = conn.execute(
-            "SELECT recorded_at, target_ts, prediction_mean "
-            "FROM prediction_events "
-            "WHERE model_version = %s AND target_ts IS NOT NULL AND target_ts >= %s",
-            (current.version, since),
-        ).fetchall()
-        outcome_rows = conn.execute(
-            "SELECT target_ts, actual_mw FROM observed_outcomes "
-            "WHERE model_name = %s AND target_ts >= %s",
-            (current.name, since),
-        ).fetchall()
-
-    report = summarize_performance(rows, {ts: value for ts, value in outcome_rows})
-    return {"window": window, "model_version": current.version, **report}
+    return reports.performance_report(
+        request.app.state.pool,
+        request.app.state.current,
+        window=window,
+        since=datetime.now(timezone.utc) - delta,
+    )
 
 
 @app.get("/drift/report")
@@ -515,115 +477,59 @@ def drift_report(request: Request, window: str = "1h"):
     except (ValueError, OverflowError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
-    since = datetime.now(timezone.utc) - delta
     state = request.app.state
-    current = state.current
+    return reports.drift_report(
+        state.pool,
+        state.current,
+        window=window,
+        since=datetime.now(timezone.utc) - delta,
+        min_samples=state.settings.drift_min_samples,
+    )
 
-    if not current.reference_sample:
-        return {
-            "window": window,
-            "model_version": current.version,
-            "sample_size": 0,
-            "status": "no_reference_sample",
-            "checks": [],
-        }
 
-    with state.pool.connection() as conn:
+@app.get("/incidents")
+def list_incidents(request: Request, status: str = "open", limit: int = 100):
+    if status not in ("open", "resolved", "all"):
+        raise HTTPException(
+            status_code=400, detail="status must be open, resolved, or all"
+        )
+    if not 1 <= limit <= 500:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
+
+    with request.app.state.pool.connection() as conn:
         rows = conn.execute(
-            "SELECT features FROM prediction_events "
-            "WHERE recorded_at >= %s AND model_version = %s AND features IS NOT NULL",
-            (since, current.version),
+            "SELECT id, dedupe_key, model_name, model_version, kind, subject, "
+            "severity, status, summary, details, first_seen, last_seen, resolved_at "
+            "FROM incidents WHERE (%s = 'all' OR status = %s) "
+            "ORDER BY last_seen DESC LIMIT %s",
+            (status, status, limit),
         ).fetchall()
 
-    observations: dict[str, list[float]] = {}
-    for (features,) in rows:
-        for feature, value in features.items():
-            if isinstance(value, (int, float)):
-                observations.setdefault(feature, []).append(float(value))
-
-    minimum = state.settings.drift_min_samples
-    if len(rows) < minimum:
-        # Not enough evidence is a different fact from "no drift"; reporting a
-        # pass here would be false confidence.
-        return {
-            "window": window,
-            "model_version": current.version,
-            "sample_size": len(rows),
-            "status": "insufficient_data",
-            "checks": [],
-        }
-
-    checks: list[dict] = []
-    for feature, reference in current.reference_sample.items():
-        if feature in TIME_DERIVED_FEATURES:
-            continue
-        values = observations.get(feature, [])
-        if len(values) < minimum:
-            checks.append(
-                {
-                    "feature": feature,
-                    "method": "psi",
-                    "statistic": None,
-                    "p_value": None,
-                    "sample_size": len(values),
-                    "status": "insufficient_data",
-                }
-            )
-            continue
-
-        psi_value = psi(reference, values)
-        ks_statistic, p_value = ks(reference, values)
-        checks.append(
-            {
-                "feature": feature,
-                "method": "psi",
-                "statistic": psi_value,
-                "p_value": None,
-                "sample_size": len(values),
-                "status": psi_status(psi_value),
-            }
-        )
-        checks.append(
-            {
-                "feature": feature,
-                "method": "ks",
-                "statistic": ks_statistic,
-                "p_value": p_value,
-                "sample_size": len(values),
-                "status": ks_status(p_value),
-            }
-        )
-
-    window_end = datetime.now(timezone.utc)
-    if checks:
-        with state.pool.connection() as conn, conn.cursor() as cursor:
-            cursor.executemany(
-                "INSERT INTO drift_checks (window_start, window_end, model_version, "
-                "feature, method, statistic, p_value, sample_size, status) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                [
-                    (
-                        since,
-                        window_end,
-                        current.version,
-                        check["feature"],
-                        check["method"],
-                        check["statistic"],
-                        check["p_value"],
-                        check["sample_size"],
-                        check["status"],
-                    )
-                    for check in checks
-                ],
-            )
-
     return {
-        "window": window,
-        "model_version": current.version,
-        "sample_size": len(rows),
-        "status": overall_status(checks),
-        "checks": checks,
+        "incidents": [
+            {
+                "id": row[0],
+                "dedupe_key": row[1],
+                "model_name": row[2],
+                "model_version": row[3],
+                "kind": row[4],
+                "subject": row[5],
+                "severity": row[6],
+                "status": row[7],
+                "summary": row[8],
+                "details": row[9],
+                "first_seen": row[10].isoformat(),
+                "last_seen": row[11].isoformat(),
+                "resolved_at": row[12].isoformat() if row[12] else None,
+            }
+            for row in rows
+        ]
     }
+
+
+@app.post("/evaluate", dependencies=[Depends(_require_token)])
+def evaluate_now(request: Request):
+    return evaluation.run_scheduled(request.app)
 
 
 @app.get("/telemetry/summary")
@@ -651,48 +557,9 @@ def quality_report(request: Request, window: str = "1h"):
     except (ValueError, OverflowError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
-    since = datetime.now(timezone.utc) - delta
-    state = request.app.state
-    current = state.current
-
-    with state.pool.connection() as conn:
-        rows = conn.execute(
-            "SELECT model_version, features FROM prediction_events "
-            "WHERE recorded_at >= %s AND features IS NOT NULL "
-            "AND model_version = %s",
-            (since, current.version),
-        ).fetchall()
-
-    observations: dict[str, list[float | None]] = {}
-    for _version, features in rows:
-        for feature, value in features.items():
-            observations.setdefault(feature, []).append(value)
-
-    # An empty window means "nothing observed yet", which must not be reported
-    # as every feature being 100% null. That would raise a false alarm for the
-    # whole sampling interval right after a promotion or restart.
-    checks = (
-        evaluate_features(current.reference_profile, observations) if rows else []
+    return reports.quality_report(
+        request.app.state.pool,
+        request.app.state.current,
+        window=window,
+        since=datetime.now(timezone.utc) - delta,
     )
-
-    window_end = datetime.now(timezone.utc)
-    if checks:
-        with state.pool.connection() as conn, conn.cursor() as cursor:
-            cursor.executemany(
-                "INSERT INTO quality_checks (window_start, window_end, model_version, "
-                "feature, check_type, expected, observed, status) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                [
-                    (since, window_end, current.version, check["feature"],
-                     check["check_type"], check["expected"], check["observed"],
-                     check["status"])
-                    for check in checks
-                ],
-            )
-
-    return {
-        "window": window,
-        "model_version": current.version,
-        "sample_count": len(rows),
-        "checks": checks,
-    }

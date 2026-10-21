@@ -14,11 +14,13 @@ reduce model incidents while maintaining inference performance.
 - ✅ Phase 1 — Baseline model serving
 - ✅ Phase 2 — Observability core
 - ✅ Phase 3 — Close the loop and drift detection
+- 🚧 Phase 4 — From observation to action (detection loop done)
 
 Phase 2 adds a versioned model registry, per-request telemetry, and data-quality
 monitoring. Phase 3 makes promotion take effect without a restart, records forecast
 outcomes so MAE and RMSE can be reported with explicit coverage, and compares live
-feature distributions against a stored reference sample using PSI and KS.
+feature distributions against a stored reference sample using PSI and KS. Phase 4a
+runs those checks on a schedule and records breaches as incidents with a lifecycle.
 
 Kern still observes; it does not act on what it observes.
 
@@ -76,9 +78,16 @@ uv run uvicorn src.kern.serving.app:app
 | GET | `/quality/report?window=1h` | Per-feature data-quality checks |
 | GET | `/performance/report?window=24h` | MAE, RMSE, samples, coverage for the serving version |
 | GET | `/drift/report?window=1h` | PSI/KS per monitored feature, persisted to `drift_checks` |
+| GET | `/incidents?status=open` | Incidents produced by the detection loop |
+| POST | `/evaluate` | Run one detection cycle immediately |
 
-`KERN_API_TOKEN`, when set, is required as `Authorization: Bearer <token>` on promotion
-and `/outcomes`. When unset both are open and startup logs a warning.
+`KERN_API_TOKEN`, when set, is required as `Authorization: Bearer <token>` on promotion,
+`/outcomes`, and `/evaluate`. When unset they are open and startup logs a warning.
+
+The detection loop evaluates quality, drift, and performance every
+`KERN_EVALUATION_INTERVAL` seconds (default 300; `0` disables it) and records breaches as
+deduplicated incidents. A healthy cycle resolves them; `insufficient_data` does not.
+Data older than `KERN_RETENTION_DAYS` (default 30) is pruned, except open incidents.
 
 Batch telemetry carries one feature snapshot for up to 256 rows, so batch predictions do
 not record a `target_ts` and are excluded from `/performance/report`. Drift checks skip

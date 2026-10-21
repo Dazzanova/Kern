@@ -26,6 +26,13 @@ class Settings(BaseSettings):
     api_token: str = ""
     reference_sample_size: int = Field(default=1000, gt=0)
     drift_min_samples: int = Field(default=100, gt=0)
+    # Seconds between scheduled detection cycles; 0 disables the loop.
+    evaluation_interval: int = Field(default=300, ge=0)
+    # Days of telemetry, checks, and resolved incidents to keep; 0 disables pruning.
+    retention_days: int = Field(default=30, ge=0)
+    performance_min_samples: int = Field(default=20, ge=1)
+    performance_mae_warn: float = Field(default=90.0, gt=0)
+    performance_mae_fail: float = Field(default=120.0, gt=0)
 
 
 @lru_cache(maxsize=1)

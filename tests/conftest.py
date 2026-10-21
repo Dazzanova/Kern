@@ -43,7 +43,7 @@ def clean_telemetry_rows(request):
     with pool.connection() as conn:
         conn.execute(
             "TRUNCATE prediction_events, quality_checks, observed_outcomes, "
-            "drift_checks RESTART IDENTITY"
+            "drift_checks, incidents RESTART IDENTITY"
         )
 
 

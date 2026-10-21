@@ -11,6 +11,7 @@ EXPECTED_TABLES = {
     "quality_checks",
     "observed_outcomes",
     "drift_checks",
+    "incidents",
 }
 
 

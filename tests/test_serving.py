@@ -620,3 +620,74 @@ def test_drift_report_computes_and_persists_psi_and_ks(baseline_model):
     }
     assert len(body["checks"]) == 4  # 2 features x 2 methods
     assert persisted == 4
+
+
+def test_evaluate_runs_a_cycle_and_records_a_drift_incident(baseline_model):
+    with TestClient(app) as client:
+        client.app.state.settings.drift_min_samples = 1
+        try:
+            client.post("/predict", json={
+                "timestamp": "2025-04-01T12:00:00",
+                "temperature_c": 80.0,
+                "humidity_pct": 99.0,
+            })
+            client.app.state.writer.drain_once()
+
+            response = client.post("/evaluate")
+
+            incidents = client.get("/incidents").json()["incidents"]
+        finally:
+            client.app.state.settings.drift_min_samples = 100
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["findings"] >= 1
+    assert body["quality"]["sample_count"] == 1
+
+    kinds = {incident["kind"] for incident in incidents}
+    assert "drift" in kinds
+    assert all(incident["status"] == "open" for incident in incidents)
+
+
+def test_evaluate_requires_the_token_when_configured(baseline_model):
+    with TestClient(app) as client:
+        client.app.state.settings.api_token = "s3cret"
+        try:
+            assert client.post("/evaluate").status_code == 401
+        finally:
+            client.app.state.settings.api_token = ""
+
+
+def test_incidents_endpoint_filters_and_orders_by_last_seen(baseline_model):
+    from kern.incidents import Finding, sync_incidents
+
+    with TestClient(app) as client:
+        pool = client.app.state.pool
+        first = Finding("drift", "temperature_c", "warn", "a", {})
+        second = Finding("drift", "humidity_pct", "warn", "b", {})
+        sync_incidents(
+            pool,
+            model_name="load-forecast",
+            model_version=baseline_model,
+            findings=[first, second],
+            evaluated_kinds={"drift"},
+        )
+        sync_incidents(
+            pool,
+            model_name="load-forecast",
+            model_version=baseline_model,
+            findings=[first],
+            evaluated_kinds={"drift"},
+        )
+
+        open_rows = client.get("/incidents").json()["incidents"]
+        all_rows = client.get("/incidents?status=all").json()["incidents"]
+
+    assert [row["subject"] for row in open_rows] == ["temperature_c"]
+    assert {row["subject"] for row in all_rows} == {"temperature_c", "humidity_pct"}
+    assert all(row["kind"] == "drift" for row in all_rows)
+
+
+def test_incidents_endpoint_rejects_an_unknown_status(baseline_model):
+    with TestClient(app) as client:
+        assert client.get("/incidents?status=bogus").status_code == 400
