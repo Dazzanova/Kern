@@ -8,12 +8,15 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "boto3>=1.40.0",
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
     "joblib>=1.6.0",
     "numpy>=2.5.3",
     "pandas>=3.0.6",
+    "psycopg[binary,pool]>=3.2.0",
     "pydantic>=2.13.5",
+    "pydantic-settings>=2.0.0",
     "pytest>=9.1.1",
     "scikit-learn>=1.9.1",
     "uvicorn>=0.54.0",
@@ -26,3 +29,8 @@ kern = "kern:main"
 [build-system]
 requires = ["uv_build>=0.12.19,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+markers = [
+    "db: requires the docker-compose stack (PostgreSQL and MinIO)",
+]

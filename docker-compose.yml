@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: kern
+      POSTGRES_PASSWORD: kern
+      POSTGRES_DB: kern
+    ports:
+      - "5432:5432"
+    volumes:
+      - kern-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kern -d kern"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  minio:
+    image: pgsty/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: kern
+      MINIO_ROOT_PASSWORD: kern-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - kern-minio:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  kern-pgdata:
+  kern-minio:

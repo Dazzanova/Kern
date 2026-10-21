@@ -40,6 +40,32 @@ Workload: 10,000 records, Concurrency 4, 3 repetitions (median reported).
 
 *Note: Latency refers to the whole HTTP request. Throughput refers to successfully processed prediction records per second. Results are local experimental measurements.*
 
+## Observability
+
+Kern versions models in a registry, records per-request telemetry, and compares live
+traffic against a reference profile of the training data.
+
+### Infrastructure
+```bash
+docker-compose up -d
+cp .env.example .env
+uv run python scripts/register_baseline.py
+uv run uvicorn src.kern.serving.app:app
+```
+
+### Endpoints
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/models` | Registered versions and stages |
+| GET | `/models/{name}/{version}` | Full version metadata |
+| POST | `/models/{name}/{version}/promote` | Make a version production |
+| GET | `/telemetry/summary?window=1h` | Request counts, latency percentiles, dropped events |
+| GET | `/quality/report?window=1h` | Per-feature data-quality checks |
+
+### Tests
+`uv run pytest` requires the compose stack. `uv run pytest -m "not db"` runs only the
+tests that need no infrastructure.
+
 ## Roadmap
 
 - [x] Baseline model and dataset
