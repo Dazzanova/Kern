@@ -11,7 +11,12 @@ reduce model incidents while maintaining inference performance.
 
 ## Status
 
-🚧 Phase 1 — Baseline model serving
+- ✅ Phase 1 — Baseline model serving
+- ✅ Phase 2 — Observability core
+- 🚧 Phase 3 — Drift detection (next)
+
+Phase 2 adds a versioned model registry, per-request telemetry, and data-quality
+monitoring. Kern now observes; it does not yet act on what it observes.
 
 ## Batch Inference
 
@@ -22,6 +27,9 @@ Kern supports batch inference to reduce HTTP and Python overhead when processing
 Accepts between 1 and 256 records. Returns predictions in the same order as input.
 
 ### How to run
+The API loads its model from the registry, so start the infrastructure first — see
+[Observability](#observability).
+
 1. Start the API: `uv run uvicorn src.kern.serving.app:app`
 2. Run tests: `uv run pytest tests/test_serving.py`
 3. Run benchmark: `uv run benchmarks/serving_perf.py`
@@ -71,9 +79,9 @@ tests that need no infrastructure.
 - [x] Baseline model and dataset
 - [x] Prediction API
 - [x] Serving benchmarks
-- [ ] Model registry
-- [ ] Runtime telemetry
-- [ ] Data-quality monitoring
+- [x] Model registry
+- [x] Runtime telemetry
+- [x] Data-quality monitoring
 - [ ] Drift detection
 - [ ] Automated retraining
 - [ ] Shadow evaluation
