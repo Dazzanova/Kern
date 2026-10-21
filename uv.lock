@@ -213,6 +213,7 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "pytest" },
     { name = "scikit-learn" },
+    { name = "scipy" },
     { name = "uvicorn" },
     { name = "xgboost" },
 ]
@@ -230,6 +231,7 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.0.0" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "scikit-learn", specifier = ">=1.9.1" },
+    { name = "scipy", specifier = ">=1.18.1" },
     { name = "uvicorn", specifier = ">=0.54.0" },
     { name = "xgboost", specifier = ">=3.4.1" },
 ]

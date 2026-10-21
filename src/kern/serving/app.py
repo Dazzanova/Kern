@@ -16,6 +16,14 @@ from xgboost import XGBRegressor
 
 from kern.config import get_settings
 from kern.data.features import build_features
+from kern.drift import (
+    TIME_DERIVED_FEATURES,
+    ks,
+    ks_status,
+    overall_status,
+    psi,
+    psi_status,
+)
 from kern.performance import summarize_performance
 from kern.quality import evaluate_features
 from kern.registry import (
@@ -86,6 +94,7 @@ class ModelState:
     version: str
     model: XGBRegressor
     reference_profile: dict[str, dict[str, float]]
+    reference_sample: dict[str, list[float]] | None
 
 
 @asynccontextmanager
@@ -115,6 +124,7 @@ async def lifespan(app: FastAPI):
             version=record.version,
             model=model,
             reference_profile=record.reference_profile,
+            reference_sample=record.reference_sample,
         )
         app.state.recorder = recorder
         app.state.writer = writer
@@ -409,6 +419,7 @@ def promote_model(name: str, version: str, request: Request):
             version=promoted.version,
             model=model,
             reference_profile=promoted.reference_profile,
+            reference_sample=promoted.reference_sample,
         )
     except Exception:
         # The commit already happened; the database is the source of truth and the
@@ -495,6 +506,124 @@ def performance_report(request: Request, window: str = "24h"):
 
     report = summarize_performance(rows, {ts: value for ts, value in outcome_rows})
     return {"window": window, "model_version": current.version, **report}
+
+
+@app.get("/drift/report")
+def drift_report(request: Request, window: str = "1h"):
+    try:
+        delta = parse_window(window)
+    except (ValueError, OverflowError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    since = datetime.now(timezone.utc) - delta
+    state = request.app.state
+    current = state.current
+
+    if not current.reference_sample:
+        return {
+            "window": window,
+            "model_version": current.version,
+            "sample_size": 0,
+            "status": "no_reference_sample",
+            "checks": [],
+        }
+
+    with state.pool.connection() as conn:
+        rows = conn.execute(
+            "SELECT features FROM prediction_events "
+            "WHERE recorded_at >= %s AND model_version = %s AND features IS NOT NULL",
+            (since, current.version),
+        ).fetchall()
+
+    observations: dict[str, list[float]] = {}
+    for (features,) in rows:
+        for feature, value in features.items():
+            if isinstance(value, (int, float)):
+                observations.setdefault(feature, []).append(float(value))
+
+    minimum = state.settings.drift_min_samples
+    if len(rows) < minimum:
+        # Not enough evidence is a different fact from "no drift"; reporting a
+        # pass here would be false confidence.
+        return {
+            "window": window,
+            "model_version": current.version,
+            "sample_size": len(rows),
+            "status": "insufficient_data",
+            "checks": [],
+        }
+
+    checks: list[dict] = []
+    for feature, reference in current.reference_sample.items():
+        if feature in TIME_DERIVED_FEATURES:
+            continue
+        values = observations.get(feature, [])
+        if len(values) < minimum:
+            checks.append(
+                {
+                    "feature": feature,
+                    "method": "psi",
+                    "statistic": None,
+                    "p_value": None,
+                    "sample_size": len(values),
+                    "status": "insufficient_data",
+                }
+            )
+            continue
+
+        psi_value = psi(reference, values)
+        ks_statistic, p_value = ks(reference, values)
+        checks.append(
+            {
+                "feature": feature,
+                "method": "psi",
+                "statistic": psi_value,
+                "p_value": None,
+                "sample_size": len(values),
+                "status": psi_status(psi_value),
+            }
+        )
+        checks.append(
+            {
+                "feature": feature,
+                "method": "ks",
+                "statistic": ks_statistic,
+                "p_value": p_value,
+                "sample_size": len(values),
+                "status": ks_status(p_value),
+            }
+        )
+
+    window_end = datetime.now(timezone.utc)
+    if checks:
+        with state.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.executemany(
+                "INSERT INTO drift_checks (window_start, window_end, model_version, "
+                "feature, method, statistic, p_value, sample_size, status) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                [
+                    (
+                        since,
+                        window_end,
+                        current.version,
+                        check["feature"],
+                        check["method"],
+                        check["statistic"],
+                        check["p_value"],
+                        check["sample_size"],
+                        check["status"],
+                    )
+                    for check in checks
+                ],
+            )
+
+    return {
+        "window": window,
+        "model_version": current.version,
+        "sample_size": len(rows),
+        "status": overall_status(checks),
+        "checks": checks,
+    }
 
 
 @app.get("/telemetry/summary")

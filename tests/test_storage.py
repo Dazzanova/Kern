@@ -10,6 +10,7 @@ EXPECTED_TABLES = {
     "prediction_events",
     "quality_checks",
     "observed_outcomes",
+    "drift_checks",
 }
 
 
@@ -31,6 +32,17 @@ def test_prediction_events_has_target_timestamp(pg):
 
     assert row is not None
     assert row[0] == "timestamp with time zone"
+
+
+def test_model_versions_has_reference_sample_column(pg):
+    with pg.connection() as conn:
+        row = conn.execute(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_name = 'model_versions' AND column_name = 'reference_sample'"
+        ).fetchone()
+
+    assert row is not None
+    assert row[0] == "jsonb"
 
 
 def test_migrations_are_idempotent(pg):

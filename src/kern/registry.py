@@ -30,6 +30,7 @@ class ModelVersion:
     metrics: dict[str, Any]
     feature_schema: list[str]
     reference_profile: dict[str, Any]
+    reference_sample: dict[str, list[float]] | None
     created_at: datetime
     promoted_at: datetime | None
 
@@ -37,11 +38,12 @@ class ModelVersion:
 _INSERT = """
 INSERT INTO model_versions (
     name, version, stage, artifact_key, artifact_sha256,
-    metrics, feature_schema, reference_profile
-) VALUES (%s, %s, 'candidate', %s, %s, %s, %s, %s)
+    metrics, feature_schema, reference_profile, reference_sample
+) VALUES (%s, %s, 'candidate', %s, %s, %s, %s, %s, %s)
 ON CONFLICT (name, version) DO NOTHING
 RETURNING id, name, version, stage, artifact_key, artifact_sha256,
-          metrics, feature_schema, reference_profile, created_at, promoted_at
+          metrics, feature_schema, reference_profile, reference_sample,
+          created_at, promoted_at
 """
 
 
@@ -56,8 +58,9 @@ def _row_to_model(row: tuple) -> ModelVersion:
         metrics=row[6],
         feature_schema=row[7],
         reference_profile=row[8],
-        created_at=row[9],
-        promoted_at=row[10],
+        reference_sample=row[9],
+        created_at=row[10],
+        promoted_at=row[11],
     )
 
 
@@ -79,6 +82,7 @@ def register(
     metrics: dict[str, Any],
     feature_schema: list[str],
     reference_profile: dict[str, Any],
+    reference_sample: dict[str, list[float]] | None = None,
 ) -> ModelVersion:
     data = Path(artifact_path).read_bytes()
     digest = compute_digest(data)
@@ -96,6 +100,7 @@ def register(
                 Jsonb(metrics),
                 Jsonb(feature_schema),
                 Jsonb(reference_profile),
+                Jsonb(reference_sample) if reference_sample is not None else None,
             ),
         ).fetchone()
 
@@ -116,7 +121,8 @@ def register(
 
 _SELECT_COLUMNS = """
 SELECT id, name, version, stage, artifact_key, artifact_sha256,
-       metrics, feature_schema, reference_profile, created_at, promoted_at
+       metrics, feature_schema, reference_profile, reference_sample,
+       created_at, promoted_at
 FROM model_versions
 """
 

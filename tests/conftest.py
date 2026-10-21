@@ -42,8 +42,8 @@ def clean_telemetry_rows(request):
         return
     with pool.connection() as conn:
         conn.execute(
-            "TRUNCATE prediction_events, quality_checks, observed_outcomes "
-            "RESTART IDENTITY"
+            "TRUNCATE prediction_events, quality_checks, observed_outcomes, "
+            "drift_checks RESTART IDENTITY"
         )
 
 
@@ -64,7 +64,7 @@ def baseline_model(pg, store, tmp_path_factory):
 
     from kern.data.features import build_features
     from kern.data.generate import generate_dataset
-    from kern.quality import profile_reference
+    from kern.quality import profile_reference, reference_sample
     from kern.registry import promote, register
 
     df = generate_dataset("2025-01-01", 500, 42)
@@ -91,6 +91,7 @@ def baseline_model(pg, store, tmp_path_factory):
         metrics={"mae": 0.0},
         feature_schema=list(X.columns),
         reference_profile=profile_reference(X, X.columns),
+        reference_sample=reference_sample(X, X.columns),
     )
     promote(pg, name="load-forecast", version="test-v1")
     return "test-v1"

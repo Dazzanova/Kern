@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     model_name: str = "load-forecast"
     # Empty disables auth on the promote and outcome-ingestion endpoints.
     api_token: str = ""
+    reference_sample_size: int = Field(default=1000, gt=0)
+    drift_min_samples: int = Field(default=100, gt=0)
 
 
 @lru_cache(maxsize=1)

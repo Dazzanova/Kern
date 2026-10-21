@@ -15,7 +15,7 @@ from xgboost import XGBRegressor  # noqa: E402
 
 from kern.config import get_settings  # noqa: E402
 from kern.data.features import build_features  # noqa: E402
-from kern.quality import profile_reference  # noqa: E402
+from kern.quality import profile_reference, reference_sample  # noqa: E402
 from kern.registry import promote, register  # noqa: E402
 from kern.storage.db import apply_migrations, create_pool  # noqa: E402
 from kern.storage.objects import ObjectStore  # noqa: E402
@@ -58,6 +58,9 @@ def main() -> None:
         metrics=metrics,
         feature_schema=list(features.columns),
         reference_profile=profile_reference(features, features.columns),
+        reference_sample=reference_sample(
+            features, features.columns, limit=settings.reference_sample_size
+        ),
     )
     promote(pool, name=settings.model_name, version=record.version)
 

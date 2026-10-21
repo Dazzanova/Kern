@@ -33,6 +33,25 @@ def profile_reference(
     return profile
 
 
+def reference_sample(
+    df: pd.DataFrame, feature_columns: Iterable[str], limit: int = 1000
+) -> dict[str, list[float]]:
+    """Sample up to `limit` non-null values per feature.
+
+    Deterministic: the sample *is* the drift baseline, so two registrations of
+    the same training data must produce the same baseline.
+    """
+    samples: dict[str, list[float]] = {}
+
+    for column in feature_columns:
+        series = pd.to_numeric(df[column], errors="coerce").dropna()
+        if limit > 0 and len(series) > limit:
+            series = series.sample(n=limit, random_state=42)
+        samples[column] = [float(value) for value in series.to_list()]
+
+    return samples
+
+
 def _status(value: float, warn: float, fail: float) -> str:
     if value > fail:
         return "fail"

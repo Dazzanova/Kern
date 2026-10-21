@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from kern.quality import evaluate_features, profile_reference
+from kern.quality import evaluate_features, profile_reference, reference_sample
 
 REFERENCE = {
     "temperature_c": {
@@ -101,3 +101,29 @@ def test_unknown_feature_is_skipped():
     # Observation keys outside the reference profile are ignored. The profile's
     # own features are still reported (temperature_c has no observations here).
     assert [r for r in results if r["feature"] == "unknown_feature"] == []
+
+
+def test_reference_sample_is_deterministic():
+    df = pd.DataFrame({"temperature_c": np.arange(50, dtype=float)})
+
+    first = reference_sample(df, ["temperature_c"], limit=10)
+    second = reference_sample(df, ["temperature_c"], limit=10)
+
+    assert first == second
+    assert len(first["temperature_c"]) == 10
+
+
+def test_reference_sample_respects_the_limit_and_drops_nulls():
+    df = pd.DataFrame({"temperature_c": [1.0, None, 3.0, None, 5.0]})
+
+    sample = reference_sample(df, ["temperature_c"], limit=100)
+
+    assert sample["temperature_c"] == [1.0, 3.0, 5.0]
+
+
+def test_reference_sample_returns_plain_floats():
+    df = pd.DataFrame({"temperature_c": np.array([1, 2, 3], dtype="int64")})
+
+    sample = reference_sample(df, ["temperature_c"])
+
+    assert all(type(value) is float for value in sample["temperature_c"])

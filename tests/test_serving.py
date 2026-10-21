@@ -562,3 +562,61 @@ def test_state_changing_endpoints_require_the_token(baseline_model):
             assert ok.status_code == 200
         finally:
             client.app.state.settings.api_token = ""
+
+
+def test_drift_report_reports_insufficient_data_on_an_empty_window(baseline_model):
+    with TestClient(app) as client:
+        response = client.get("/drift/report?window=1h")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "insufficient_data"
+    assert body["sample_size"] == 0
+    assert body["checks"] == []
+
+
+def test_drift_report_requires_a_reference_sample(baseline_model):
+    from dataclasses import replace
+
+    with TestClient(app) as client:
+        client.app.state.current = replace(
+            client.app.state.current, reference_sample=None
+        )
+        response = client.get("/drift/report?window=1h")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "no_reference_sample"
+    assert body["checks"] == []
+
+
+def test_drift_report_computes_and_persists_psi_and_ks(baseline_model):
+    with TestClient(app) as client:
+        client.app.state.settings.drift_min_samples = 1
+        try:
+            client.post("/predict", json=PAYLOAD)
+            client.app.state.writer.drain_once()
+
+            response = client.get("/drift/report?window=1h")
+
+            with client.app.state.pool.connection() as conn:
+                persisted = conn.execute(
+                    "SELECT count(*) FROM drift_checks WHERE model_version = %s",
+                    (baseline_model,),
+                ).fetchone()[0]
+        finally:
+            client.app.state.settings.drift_min_samples = 100
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["sample_size"] == 1
+    assert body["status"] in {"pass", "warn", "fail"}
+    assert {check["method"] for check in body["checks"]} == {"psi", "ks"}
+    # Time-derived features (hour, month, ...) are excluded: they encode the
+    # clock, not the input distribution. Only the 2 exogenous features remain.
+    assert {check["feature"] for check in body["checks"]} == {
+        "temperature_c",
+        "humidity_pct",
+    }
+    assert len(body["checks"]) == 4  # 2 features x 2 methods
+    assert persisted == 4
