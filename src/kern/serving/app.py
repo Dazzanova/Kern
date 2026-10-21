@@ -1,23 +1,30 @@
 import logging
+import math
+import secrets
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from time import perf_counter
 from uuid import uuid4
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from xgboost import XGBRegressor
 
 from kern.config import get_settings
 from kern.data.features import build_features
+from kern.performance import summarize_performance
 from kern.quality import evaluate_features
 from kern.registry import (
     ModelNotFound,
+    RegistryError,
     get_version,
     list_versions,
     load_production,
+    load_version,
     promote,
 )
 from kern.storage.db import apply_migrations, create_pool
@@ -57,6 +64,30 @@ class BatchPredictionResponse(BaseModel):
     predictions: list[float]
 
 
+class OutcomeObservation(BaseModel):
+    target_ts: datetime
+    actual_mw: float
+
+
+class OutcomeRequest(BaseModel):
+    observations: list[OutcomeObservation] = Field(..., min_length=1, max_length=1000)
+
+
+@dataclass(frozen=True)
+class ModelState:
+    """Everything a request needs to serve, replaced wholesale on promotion.
+
+    Handlers capture this once at the top. Because it is frozen and swapped rather
+    than mutated, a request that began under one version finishes under it even if
+    a promotion lands mid-flight. No lock is needed on the read path.
+    """
+
+    name: str
+    version: str
+    model: XGBRegressor
+    reference_profile: dict[str, dict[str, float]]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -79,12 +110,21 @@ async def lifespan(app: FastAPI):
         app.state.settings = settings
         app.state.pool = pool
         app.state.store = store
-        app.state.model = model
-        app.state.model_version = record.version
-        app.state.reference_profile = record.reference_profile
+        app.state.current = ModelState(
+            name=record.name,
+            version=record.version,
+            model=model,
+            reference_profile=record.reference_profile,
+        )
         app.state.recorder = recorder
         app.state.writer = writer
         writer.start()
+
+        if not settings.api_token:
+            logger.warning(
+                "KERN_API_TOKEN is unset: /models/*/promote and /outcomes are "
+                "unauthenticated; set it before exposing this service"
+            )
     except Exception as error:
         if pool is not None:
             pool.close()
@@ -133,7 +173,7 @@ def ready(request: Request):
 
     body = {
         "ready": database and object_store,
-        "model_version": state.model_version,
+        "model_version": state.current.version,
         "database": database,
         "object_store": object_store,
     }
@@ -144,6 +184,7 @@ def ready(request: Request):
 
 def _record(
     app: FastAPI,
+    current: ModelState,
     *,
     request_id: str,
     endpoint: str,
@@ -151,6 +192,7 @@ def _record(
     duration_ms: float,
     predictions: np.ndarray,
     feature_frame: pd.DataFrame,
+    target_ts: datetime | None = None,
 ) -> None:
     """Hand off telemetry without blocking the request.
 
@@ -167,7 +209,7 @@ def _record(
             PredictionEvent(
                 request_id=request_id,
                 model_name=app.state.settings.model_name,
-                model_version=app.state.model_version,
+                model_version=current.version,
                 endpoint=endpoint,
                 batch_size=batch_size,
                 duration_ms=duration_ms,
@@ -175,6 +217,7 @@ def _record(
                 prediction_mean=float(predictions.mean()),
                 prediction_max=float(predictions.max()),
                 features=snapshot,
+                target_ts=target_ts,
             )
         )
     except Exception:
@@ -184,27 +227,36 @@ def _record(
 @app.post("/predict", response_model=PredictionResponse)
 def predict(payload: PredictionRequest, request: Request):
     request_id = str(uuid4())
+    current = request.app.state.current
 
     input_df = pd.DataFrame([payload.model_dump()])
     features = build_features(input_df)
 
     start = perf_counter()
-    prediction = request.app.state.model.predict(features)[0]
+    prediction = current.model.predict(features)[0]
     latency_ms = (perf_counter() - start) * 1000
+
+    # Naive input is read as UTC: the column is timestamptz and the training data
+    # is UTC, so letting the session timezone decide would silently shift hours.
+    target_ts = payload.timestamp
+    if target_ts.tzinfo is None:
+        target_ts = target_ts.replace(tzinfo=timezone.utc)
 
     _record(
         request.app,
+        current,
         request_id=request_id,
         endpoint="predict",
         batch_size=1,
         duration_ms=latency_ms,
         predictions=np.asarray([prediction]),
         feature_frame=features,
+        target_ts=target_ts,
     )
 
     return PredictionResponse(
         request_id=request_id,
-        model_version=request.app.state.model_version,
+        model_version=current.version,
         prediction_mw=float(prediction),
         inference_latency_ms=latency_ms,
     )
@@ -213,6 +265,7 @@ def predict(payload: PredictionRequest, request: Request):
 @app.post("/predict/batch", response_model=BatchPredictionResponse)
 def predict_batch(payload: BatchPredictionRequest, request: Request):
     request_id = str(uuid4())
+    current = request.app.state.current
     start = perf_counter()
 
     # Convert records to DataFrame efficiently
@@ -222,15 +275,19 @@ def predict_batch(payload: BatchPredictionRequest, request: Request):
     features = build_features(input_df)
 
     # Single model call for the whole batch
-    predictions = request.app.state.model.predict(features)
+    predictions = current.model.predict(features)
 
     # Ensure predictions are finite
     predictions = np.nan_to_num(predictions, nan=0.0, posinf=0.0, neginf=0.0)
 
     processing_time_ms = (perf_counter() - start) * 1000
 
+    # No target_ts: one event covers up to 256 distinct target hours, so it cannot
+    # be attributed to a single outcome. Batch requests are excluded from
+    # performance reporting by design.
     _record(
         request.app,
+        current,
         request_id=request_id,
         endpoint="predict/batch",
         batch_size=len(payload.records),
@@ -241,7 +298,7 @@ def predict_batch(payload: BatchPredictionRequest, request: Request):
 
     return BatchPredictionResponse(
         request_id=request_id,
-        model_version=request.app.state.model_version,
+        model_version=current.version,
         batch_size=len(payload.records),
         total_processing_time_ms=processing_time_ms,
         predictions=[float(p) for p in predictions],
@@ -314,19 +371,130 @@ def model_detail(name: str, version: str, request: Request):
     }
 
 
-@app.post("/models/{name}/{version}/promote")
+def _require_token(request: Request) -> None:
+    """Bearer-token guard for state-changing endpoints.
+
+    Empty `KERN_API_TOKEN` disables the check; startup warns in that case.
+    """
+    token = request.app.state.settings.api_token
+    if not token:
+        return
+
+    scheme, _, provided = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not secrets.compare_digest(provided, token):
+        raise HTTPException(status_code=401, detail="missing or invalid bearer token")
+
+
+@app.post("/models/{name}/{version}/promote", dependencies=[Depends(_require_token)])
 def promote_model(name: str, version: str, request: Request):
+    state = request.app.state
+
+    # Load first: a version that cannot be verified is never promoted, so the
+    # database cannot claim to serve something this process could not run.
     try:
-        record = promote(request.app.state.pool, name=name, version=version)
+        model, _loaded = load_version(state.pool, state.store, name, version)
+    except ModelNotFound as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except RegistryError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+    try:
+        promoted = promote(state.pool, name=name, version=version)
     except ModelNotFound as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
 
+    try:
+        state.current = ModelState(
+            name=promoted.name,
+            version=promoted.version,
+            model=model,
+            reference_profile=promoted.reference_profile,
+        )
+    except Exception:
+        # The commit already happened; the database is the source of truth and the
+        # next restart converges. Surface the failure rather than pretend success.
+        logger.exception("promoted %s %s but failed to swap in-memory state", name, version)
+        raise HTTPException(
+            status_code=500,
+            detail=f"{name} {version} promoted in the registry but not loaded into this process",
+        ) from None
+
     return {
-        "name": record.name,
-        "version": record.version,
-        "stage": record.stage,
-        "promoted_at": record.promoted_at.isoformat() if record.promoted_at else None,
+        "name": promoted.name,
+        "version": promoted.version,
+        "stage": promoted.stage,
+        "promoted_at": promoted.promoted_at.isoformat() if promoted.promoted_at else None,
     }
+
+
+@app.post("/outcomes", dependencies=[Depends(_require_token)])
+def ingest_outcomes(payload: OutcomeRequest, request: Request):
+    state = request.app.state
+    model_name = state.settings.model_name
+    inserted = 0
+    updated = 0
+
+    # Validated here rather than with a field constraint: a NaN/Infinity value
+    # makes the 422 body itself unserialisable, so the check must produce a
+    # string detail instead of an echo of the offending input.
+    if not all(math.isfinite(item.actual_mw) for item in payload.observations):
+        raise HTTPException(
+            status_code=422, detail="actual_mw must be a finite number"
+        )
+
+    with state.pool.connection() as conn, conn.cursor() as cursor:
+        for observation in payload.observations:
+            target_ts = observation.target_ts
+            if target_ts.tzinfo is None:
+                target_ts = target_ts.replace(tzinfo=timezone.utc)
+            row = cursor.execute(
+                """
+                INSERT INTO observed_outcomes (model_name, target_ts, actual_mw)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (model_name, target_ts)
+                DO UPDATE SET actual_mw = EXCLUDED.actual_mw, observed_at = now()
+                RETURNING (xmax = 0) AS inserted
+                """,
+                (model_name, target_ts, observation.actual_mw),
+            ).fetchone()
+            if row[0]:
+                inserted += 1
+            else:
+                updated += 1
+
+    return {
+        "model_name": model_name,
+        "inserted": inserted,
+        "updated": updated,
+    }
+
+
+@app.get("/performance/report")
+def performance_report(request: Request, window: str = "24h"):
+    try:
+        delta = parse_window(window)
+    except (ValueError, OverflowError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    since = datetime.now(timezone.utc) - delta
+    state = request.app.state
+    current = state.current
+
+    with state.pool.connection() as conn:
+        rows = conn.execute(
+            "SELECT recorded_at, target_ts, prediction_mean "
+            "FROM prediction_events "
+            "WHERE model_version = %s AND target_ts IS NOT NULL AND target_ts >= %s",
+            (current.version, since),
+        ).fetchall()
+        outcome_rows = conn.execute(
+            "SELECT target_ts, actual_mw FROM observed_outcomes "
+            "WHERE model_name = %s AND target_ts >= %s",
+            (current.name, since),
+        ).fetchall()
+
+    report = summarize_performance(rows, {ts: value for ts, value in outcome_rows})
+    return {"window": window, "model_version": current.version, **report}
 
 
 @app.get("/telemetry/summary")
@@ -356,13 +524,14 @@ def quality_report(request: Request, window: str = "1h"):
 
     since = datetime.now(timezone.utc) - delta
     state = request.app.state
+    current = state.current
 
     with state.pool.connection() as conn:
         rows = conn.execute(
             "SELECT model_version, features FROM prediction_events "
             "WHERE recorded_at >= %s AND features IS NOT NULL "
             "AND model_version = %s",
-            (since, state.model_version),
+            (since, current.version),
         ).fetchall()
 
     observations: dict[str, list[float | None]] = {}
@@ -374,7 +543,7 @@ def quality_report(request: Request, window: str = "1h"):
     # as every feature being 100% null. That would raise a false alarm for the
     # whole sampling interval right after a promotion or restart.
     checks = (
-        evaluate_features(state.reference_profile, observations) if rows else []
+        evaluate_features(current.reference_profile, observations) if rows else []
     )
 
     window_end = datetime.now(timezone.utc)
@@ -385,7 +554,7 @@ def quality_report(request: Request, window: str = "1h"):
                 "feature, check_type, expected, observed, status) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                 [
-                    (since, window_end, state.model_version, check["feature"],
+                    (since, window_end, current.version, check["feature"],
                      check["check_type"], check["expected"], check["observed"],
                      check["status"])
                     for check in checks
@@ -394,7 +563,7 @@ def quality_report(request: Request, window: str = "1h"):
 
     return {
         "window": window,
-        "model_version": state.model_version,
+        "model_version": current.version,
         "sample_count": len(rows),
         "checks": checks,
     }

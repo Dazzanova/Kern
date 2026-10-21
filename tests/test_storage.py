@@ -4,7 +4,13 @@ from kern.storage.db import apply_migrations
 
 pytestmark = pytest.mark.db
 
-EXPECTED_TABLES = {"schema_migrations", "model_versions", "prediction_events", "quality_checks"}
+EXPECTED_TABLES = {
+    "schema_migrations",
+    "model_versions",
+    "prediction_events",
+    "quality_checks",
+    "observed_outcomes",
+}
 
 
 def test_migrations_create_all_tables(pg):
@@ -14,6 +20,17 @@ def test_migrations_create_all_tables(pg):
         ).fetchall()
 
     assert EXPECTED_TABLES <= {row[0] for row in rows}
+
+
+def test_prediction_events_has_target_timestamp(pg):
+    with pg.connection() as conn:
+        row = conn.execute(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_name = 'prediction_events' AND column_name = 'target_ts'"
+        ).fetchone()
+
+    assert row is not None
+    assert row[0] == "timestamp with time zone"
 
 
 def test_migrations_are_idempotent(pg):

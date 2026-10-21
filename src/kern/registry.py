@@ -170,19 +170,12 @@ def promote(pool, *, name: str, version: str) -> ModelVersion:
     return get_version(pool, name, version)
 
 
-def load_production(pool, store: ObjectStore, name: str) -> tuple[XGBRegressor, ModelVersion]:
-    with pool.connection() as conn:
-        row = conn.execute(
-            _SELECT_COLUMNS + " WHERE name = %s AND stage = 'production'", (name,)
-        ).fetchone()
-    if row is None:
-        raise ModelNotFound(f"no production version for {name}")
-
-    record = _row_to_model(row)
+def _load_record(store: ObjectStore, record: ModelVersion) -> XGBRegressor:
+    """Download, verify, and deserialize one registered artifact."""
     data = store.get(record.artifact_key)
     if compute_digest(data) != record.artifact_sha256:
         raise RegistryError(
-            f"artifact digest mismatch for {name} {record.version}"
+            f"artifact digest mismatch for {record.name} {record.version}"
         )
 
     model = XGBRegressor()
@@ -191,13 +184,35 @@ def load_production(pool, store: ObjectStore, name: str) -> tuple[XGBRegressor, 
     stored = list(model.get_booster().feature_names or [])
     if not stored:
         raise RegistryError(
-            f"artifact for {name} {record.version} stores no feature names; "
+            f"artifact for {record.name} {record.version} stores no feature names; "
             "cannot verify schema"
         )
     if stored != list(record.feature_schema):
         raise RegistryError(
-            f"feature schema mismatch for {name} {record.version}: "
+            f"feature schema mismatch for {record.name} {record.version}: "
             f"artifact expects {stored}, registry says {list(record.feature_schema)}"
         )
 
-    return model, record
+    return model
+
+
+def load_version(
+    pool, store: ObjectStore, name: str, version: str
+) -> tuple[XGBRegressor, ModelVersion]:
+    """Load and verify a specific version, whether or not it is production."""
+    record = get_version(pool, name, version)
+    return _load_record(store, record), record
+
+
+def load_production(
+    pool, store: ObjectStore, name: str
+) -> tuple[XGBRegressor, ModelVersion]:
+    with pool.connection() as conn:
+        row = conn.execute(
+            _SELECT_COLUMNS + " WHERE name = %s AND stage = 'production'", (name,)
+        ).fetchone()
+    if row is None:
+        raise ModelNotFound(f"no production version for {name}")
+
+    record = _row_to_model(row)
+    return _load_record(store, record), record

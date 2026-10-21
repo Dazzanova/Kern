@@ -15,7 +15,10 @@ FEATURE_COLUMNS = [
 
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    timestamps = pd.to_datetime(df["timestamp"])
+    # Normalise to naive UTC so tz-aware payloads (e.g. "...T12:00:00Z") work and
+    # so `time_index_hours` never subtracts naive from aware. The training data is
+    # UTC, so a naive timestamp is interpreted as UTC rather than local time.
+    timestamps = pd.to_datetime(df["timestamp"], utc=True).dt.tz_localize(None)
 
     features = pd.DataFrame(
         {

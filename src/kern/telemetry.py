@@ -24,6 +24,9 @@ class PredictionEvent:
     prediction_mean: float | None
     prediction_max: float | None
     features: dict[str, Any] | None
+    # The timestamp the prediction is *for*. Null for batch requests, where one
+    # event covers up to 256 different target hours and cannot be attributed.
+    target_ts: datetime | None = None
 
 
 class TelemetryRecorder:
@@ -80,8 +83,9 @@ class TelemetryRecorder:
 _INSERT = """
 INSERT INTO prediction_events (
     request_id, model_name, model_version, endpoint, batch_size,
-    duration_ms, prediction_min, prediction_mean, prediction_max, features
-) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    duration_ms, prediction_min, prediction_mean, prediction_max, features,
+    target_ts
+) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
 
 
@@ -146,6 +150,7 @@ class TelemetryWriter:
                 event.prediction_mean,
                 event.prediction_max,
                 Jsonb(event.features) if event.features is not None else None,
+                event.target_ts,
             )
             for event in batch
         ]

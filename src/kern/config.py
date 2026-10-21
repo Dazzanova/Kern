@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     feature_sample_rate: float = Field(default=0.05, ge=0.0, le=1.0)
     telemetry_queue_size: int = Field(default=10_000, gt=0)
     model_name: str = "load-forecast"
+    # Empty disables auth on the promote and outcome-ingestion endpoints.
+    api_token: str = ""
 
 
 @lru_cache(maxsize=1)

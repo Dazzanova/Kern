@@ -1,4 +1,5 @@
 import math
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -362,3 +363,202 @@ def test_quality_report_ignores_other_model_versions(baseline_model):
     body = response.json()
     assert body["sample_count"] == 0
     assert body["checks"] == []
+
+
+def _register_version(pg, store, tmp_path, version, feature_schema=None):
+    """Train a tiny deterministic model and register it under `version`."""
+    from kern.data.features import build_features
+    from kern.data.generate import generate_dataset
+    from kern.quality import profile_reference
+    from kern.registry import register
+    from xgboost import XGBRegressor
+
+    df = generate_dataset("2025-01-01", 200, 7)
+    X = build_features(df)
+    model = XGBRegressor(n_estimators=5, max_depth=2, random_state=7)
+    model.fit(X, df["load_mw"])
+
+    path = tmp_path / f"{version}.json"
+    model.save_model(path)
+
+    return register(
+        pg,
+        store,
+        name="load-forecast",
+        version=version,
+        artifact_path=path,
+        metrics={"mae": 1.0},
+        feature_schema=feature_schema or list(X.columns),
+        reference_profile=profile_reference(X, X.columns),
+    )
+
+
+def _drop_version(pg, version):
+    with pg.connection() as conn:
+        conn.execute(
+            "DELETE FROM model_versions WHERE name = 'load-forecast' AND version = %s",
+            (version,),
+        )
+
+
+PAYLOAD = {
+    "timestamp": "2025-04-01T12:00:00",
+    "temperature_c": 25.0,
+    "humidity_pct": 55.0,
+}
+
+
+def test_promote_hot_swaps_the_serving_model(pg, store, baseline_model, tmp_path):
+    """Promotion must take effect in this process, without a restart."""
+    _register_version(pg, store, tmp_path, "test-v2")
+
+    try:
+        with TestClient(app) as client:
+            assert client.get("/ready").json()["model_version"] == baseline_model
+
+            response = client.post("/models/load-forecast/test-v2/promote")
+            assert response.status_code == 200
+
+            served = client.post("/predict", json=PAYLOAD).json()
+            assert served["model_version"] == "test-v2"
+            assert math.isfinite(served["prediction_mw"])
+    finally:
+        from kern.registry import promote as promote_version
+
+        promote_version(pg, name="load-forecast", version=baseline_model)
+        _drop_version(pg, "test-v2")
+
+
+def test_promote_rejects_a_version_that_cannot_be_loaded(pg, store, baseline_model, tmp_path):
+    """A bad artifact must not move the production pointer."""
+    _register_version(pg, store, tmp_path, "test-bad", feature_schema=["wrong"])
+
+    try:
+        with TestClient(app) as client:
+            response = client.post("/models/load-forecast/test-bad/promote")
+            assert response.status_code == 409
+
+            still_serving = client.get("/ready").json()["model_version"]
+            assert still_serving == baseline_model
+    finally:
+        _drop_version(pg, "test-bad")
+
+
+def test_outcomes_upsert_and_feed_the_performance_report(baseline_model):
+    target = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    with TestClient(app) as client:
+        prediction = client.post("/predict", json={
+            "timestamp": target.isoformat(),
+            "temperature_c": 25.0,
+            "humidity_pct": 55.0,
+        }).json()
+        client.app.state.writer.drain_once()
+
+        first = client.post("/outcomes", json={"observations": [
+            {"target_ts": target.isoformat(), "actual_mw": prediction["prediction_mw"] + 10.0}
+        ]})
+        assert first.status_code == 200
+        assert first.json()["inserted"] == 1
+        assert first.json()["updated"] == 0
+
+        second = client.post("/outcomes", json={"observations": [
+            {"target_ts": target.isoformat(), "actual_mw": prediction["prediction_mw"] + 20.0}
+        ]})
+        assert second.json()["inserted"] == 0
+        assert second.json()["updated"] == 1
+
+        report = client.get("/performance/report?window=24h").json()
+
+    assert report["model_version"] == baseline_model
+    assert report["samples"] == 1
+    assert report["mae"] == pytest.approx(20.0)
+    assert report["coverage"] == 1.0
+
+
+def test_outcomes_reject_non_finite_values(baseline_model):
+    target = datetime.now(timezone.utc) + timedelta(hours=1)
+    # Sent as raw text: the default JSON encoder refuses to serialise infinity,
+    # but a hostile or buggy client can still put the literal on the wire.
+    body = (
+        '{"observations": [{"target_ts": "%s", "actual_mw": Infinity}]}'
+        % target.isoformat()
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/outcomes", content=body, headers={"content-type": "application/json"}
+        )
+
+    assert response.status_code == 422
+
+
+def test_single_predictions_record_the_target_timestamp(baseline_model):
+    target = datetime.now(timezone.utc) + timedelta(hours=2)
+
+    with TestClient(app) as client:
+        client.post("/predict", json={
+            "timestamp": target.isoformat(),
+            "temperature_c": 25.0,
+            "humidity_pct": 55.0,
+        })
+        client.app.state.writer.drain_once()
+
+        with client.app.state.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT target_ts FROM prediction_events ORDER BY recorded_at DESC LIMIT 1"
+            ).fetchone()
+
+    assert row[0] is not None
+    assert abs((row[0] - target).total_seconds()) < 1
+
+
+def test_batch_predictions_leave_the_target_empty(baseline_model):
+    """One batch event covers many hours and cannot be attributed."""
+    with TestClient(app) as client:
+        client.post("/predict/batch", json={"records": [PAYLOAD, PAYLOAD]})
+        client.app.state.writer.drain_once()
+
+        with client.app.state.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT target_ts FROM prediction_events ORDER BY recorded_at DESC LIMIT 1"
+            ).fetchone()
+
+    assert row[0] is None
+
+
+def test_promote_is_open_when_no_token_is_configured(baseline_model):
+    with TestClient(app) as client:
+        assert client.app.state.settings.api_token == ""
+        response = client.post(f"/models/load-forecast/{baseline_model}/promote")
+
+    assert response.status_code == 200
+
+
+def test_state_changing_endpoints_require_the_token(baseline_model):
+    target = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    with TestClient(app) as client:
+        client.app.state.settings.api_token = "s3cret"
+        try:
+            assert client.post(
+                f"/models/load-forecast/{baseline_model}/promote"
+            ).status_code == 401
+            assert client.post(
+                f"/models/load-forecast/{baseline_model}/promote",
+                headers={"authorization": "Bearer wrong"},
+            ).status_code == 401
+            assert client.post(
+                "/outcomes",
+                json={"observations": [
+                    {"target_ts": target.isoformat(), "actual_mw": 1.0}
+                ]},
+            ).status_code == 401
+
+            ok = client.post(
+                f"/models/load-forecast/{baseline_model}/promote",
+                headers={"authorization": "Bearer s3cret"},
+            )
+            assert ok.status_code == 200
+        finally:
+            client.app.state.settings.api_token = ""

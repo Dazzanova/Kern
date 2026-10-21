@@ -41,7 +41,10 @@ def clean_telemetry_rows(request):
     if pool is None:
         return
     with pool.connection() as conn:
-        conn.execute("TRUNCATE prediction_events, quality_checks RESTART IDENTITY")
+        conn.execute(
+            "TRUNCATE prediction_events, quality_checks, observed_outcomes "
+            "RESTART IDENTITY"
+        )
 
 
 @pytest.fixture(scope="session")
