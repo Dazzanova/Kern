@@ -12,6 +12,7 @@ EXPECTED_TABLES = {
     "observed_outcomes",
     "drift_checks",
     "incidents",
+    "promotion_decisions",
 }
 
 

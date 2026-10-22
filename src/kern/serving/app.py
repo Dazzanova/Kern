@@ -14,12 +14,13 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from xgboost import XGBRegressor
 
-from kern import evaluation, reports
+from kern import evaluation, policy, reports
 from kern.config import get_settings
 from kern.data.features import build_features
 from kern.registry import (
     ModelNotFound,
     RegistryError,
+    get_production,
     get_version,
     list_versions,
     load_production,
@@ -371,17 +372,53 @@ def _require_token(request: Request) -> None:
 
 
 @app.post("/models/{name}/{version}/promote", dependencies=[Depends(_require_token)])
-def promote_model(name: str, version: str, request: Request):
+def promote_model(name: str, version: str, request: Request, force: bool = False):
     state = request.app.state
 
     # Load first: a version that cannot be verified is never promoted, so the
     # database cannot claim to serve something this process could not run.
     try:
-        model, _loaded = load_version(state.pool, state.store, name, version)
+        model, candidate = load_version(state.pool, state.store, name, version)
     except ModelNotFound as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except RegistryError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+
+    production = get_production(state.pool, name)
+
+    if production is not None and production.version == version:
+        decision = policy.Decision(
+            allowed=True,
+            reasons=["already the production version"],
+            details={"version": version},
+        )
+    else:
+        decision = policy.evaluate_promotion(
+            candidate=candidate,
+            production=production,
+            open_critical=policy.open_critical_incidents(state.pool, name),
+            margin=state.settings.promotion_min_improvement,
+        )
+
+        if not decision.allowed and not force:
+            policy.record_decision(
+                state.pool,
+                model_name=name,
+                version=version,
+                production_version=production.version if production else None,
+                decision="blocked",
+                reasons=decision.reasons,
+                metrics=candidate.metrics,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "promotion blocked by policy",
+                    "reasons": decision.reasons,
+                    "metrics": candidate.metrics,
+                    "production_version": production.version if production else None,
+                },
+            )
 
     try:
         promoted = promote(state.pool, name=name, version=version)
@@ -405,10 +442,23 @@ def promote_model(name: str, version: str, request: Request):
             detail=f"{name} {version} promoted in the registry but not loaded into this process",
         ) from None
 
+    recorded = "forced" if force and not decision.allowed else "allowed"
+    policy.record_decision(
+        state.pool,
+        model_name=name,
+        version=version,
+        production_version=production.version if production else None,
+        decision=recorded,
+        reasons=decision.reasons,
+        metrics=candidate.metrics,
+    )
+
     return {
         "name": promoted.name,
         "version": promoted.version,
         "stage": promoted.stage,
+        "decision": recorded,
+        "reasons": decision.reasons,
         "promoted_at": promoted.promoted_at.isoformat() if promoted.promoted_at else None,
     }
 

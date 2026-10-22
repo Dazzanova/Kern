@@ -43,7 +43,7 @@ def clean_telemetry_rows(request):
     with pool.connection() as conn:
         conn.execute(
             "TRUNCATE prediction_events, quality_checks, observed_outcomes, "
-            "drift_checks, incidents RESTART IDENTITY"
+            "drift_checks, incidents, promotion_decisions RESTART IDENTITY"
         )
 
 
@@ -88,7 +88,7 @@ def baseline_model(pg, store, tmp_path_factory):
         name="load-forecast",
         version="test-v1",
         artifact_path=path,
-        metrics={"mae": 0.0},
+        metrics={"mae": 100.0, "rmse": 120.0},
         feature_schema=list(X.columns),
         reference_profile=profile_reference(X, X.columns),
         reference_sample=reference_sample(X, X.columns),

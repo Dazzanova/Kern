@@ -365,7 +365,7 @@ def test_quality_report_ignores_other_model_versions(baseline_model):
     assert body["checks"] == []
 
 
-def _register_version(pg, store, tmp_path, version, feature_schema=None):
+def _register_version(pg, store, tmp_path, version, feature_schema=None, metrics=None):
     """Train a tiny deterministic model and register it under `version`."""
     from kern.data.features import build_features
     from kern.data.generate import generate_dataset
@@ -387,7 +387,7 @@ def _register_version(pg, store, tmp_path, version, feature_schema=None):
         name="load-forecast",
         version=version,
         artifact_path=path,
-        metrics={"mae": 1.0},
+        metrics=metrics or {"mae": 1.0},
         feature_schema=feature_schema or list(X.columns),
         reference_profile=profile_reference(X, X.columns),
     )
@@ -691,3 +691,94 @@ def test_incidents_endpoint_filters_and_orders_by_last_seen(baseline_model):
 def test_incidents_endpoint_rejects_an_unknown_status(baseline_model):
     with TestClient(app) as client:
         assert client.get("/incidents?status=bogus").status_code == 400
+
+
+def test_promote_blocks_a_worse_candidate_and_keeps_production(pg, store, baseline_model, tmp_path):
+    _register_version(pg, store, tmp_path, "test-worse", metrics={"mae": 500.0})
+
+    try:
+        with TestClient(app) as client:
+            response = client.post("/models/load-forecast/test-worse/promote")
+            served = client.get("/ready").json()["model_version"]
+
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert detail["production_version"] == baseline_model
+        assert any("does not improve" in reason for reason in detail["reasons"])
+        assert served == baseline_model
+
+        with pg.connection() as conn:
+            row = conn.execute(
+                "SELECT decision, reasons FROM promotion_decisions ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        assert row[0] == "blocked"
+        assert any("does not improve" in reason for reason in row[1])
+    finally:
+        _drop_version(pg, "test-worse")
+
+
+def test_forced_promotion_overrides_the_gate_and_is_recorded(pg, store, baseline_model, tmp_path):
+    _register_version(pg, store, tmp_path, "test-forced", metrics={"mae": 500.0})
+
+    try:
+        with TestClient(app) as client:
+            response = client.post("/models/load-forecast/test-forced/promote?force=true")
+            assert response.status_code == 200
+            assert response.json()["decision"] == "forced"
+            assert client.get("/ready").json()["model_version"] == "test-forced"
+
+        with pg.connection() as conn:
+            row = conn.execute(
+                "SELECT decision, reasons FROM promotion_decisions ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        assert row[0] == "forced"
+        assert any("does not improve" in reason for reason in row[1])
+    finally:
+        from kern.registry import promote as promote_version
+
+        promote_version(pg, name="load-forecast", version=baseline_model)
+        _drop_version(pg, "test-forced")
+
+
+def test_open_critical_incident_blocks_an_otherwise_better_candidate(
+    pg, store, baseline_model, tmp_path
+):
+    from kern.incidents import Finding, sync_incidents
+
+    _register_version(pg, store, tmp_path, "test-gated", metrics={"mae": 1.0})
+
+    try:
+        sync_incidents(
+            pg,
+            model_name="load-forecast",
+            model_version=baseline_model,
+            findings=[Finding("drift", "temperature_c", "critical", "PSI 0.9", {})],
+            evaluated_kinds=set(),
+        )
+
+        with TestClient(app) as client:
+            blocked = client.post("/models/load-forecast/test-gated/promote")
+            assert blocked.status_code == 409
+            assert any(
+                "open critical incident" in reason
+                for reason in blocked.json()["detail"]["reasons"]
+            )
+            assert client.get("/ready").json()["model_version"] == baseline_model
+
+        sync_incidents(
+            pg,
+            model_name="load-forecast",
+            model_version=baseline_model,
+            findings=[],
+            evaluated_kinds={"drift"},
+        )
+
+        with TestClient(app) as client:
+            allowed = client.post("/models/load-forecast/test-gated/promote")
+            assert allowed.status_code == 200
+            assert allowed.json()["decision"] == "allowed"
+    finally:
+        from kern.registry import promote as promote_version
+
+        promote_version(pg, name="load-forecast", version=baseline_model)
+        _drop_version(pg, "test-gated")

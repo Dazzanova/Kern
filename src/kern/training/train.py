@@ -16,19 +16,24 @@ TARGET = "load_mw"
 __all__ = ["build_features", "train_model", "main"]
 
 
-def train_model(X_train: pd.DataFrame, y_train: pd.Series) -> XGBRegressor:
-    model = XGBRegressor(
-        objective="reg:squarederror",
-        n_estimators=500,
-        learning_rate=0.05,
-        max_depth=6,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_lambda=1.0,
-        random_state=42,
-        n_jobs=-1,
-        tree_method="hist",
-    )
+def train_model(
+    X_train: pd.DataFrame, y_train: pd.Series, **overrides
+) -> XGBRegressor:
+    params = {
+        "objective": "reg:squarederror",
+        "n_estimators": 500,
+        "learning_rate": 0.05,
+        "max_depth": 6,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "reg_lambda": 1.0,
+        "random_state": 42,
+        "n_jobs": -1,
+        "tree_method": "hist",
+    }
+    params.update(overrides)
+
+    model = XGBRegressor(**params)
 
     model.fit(X_train, y_train)
 

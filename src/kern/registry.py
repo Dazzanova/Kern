@@ -137,6 +137,15 @@ def get_version(pool, name: str, version: str) -> ModelVersion:
     return _row_to_model(row)
 
 
+def get_production(pool, name: str) -> ModelVersion | None:
+    """Return the production record without loading its artifact, or None."""
+    with pool.connection() as conn:
+        row = conn.execute(
+            _SELECT_COLUMNS + " WHERE name = %s AND stage = 'production'", (name,)
+        ).fetchone()
+    return _row_to_model(row) if row is not None else None
+
+
 def list_versions(pool, name: str | None = None) -> list[ModelVersion]:
     query = _SELECT_COLUMNS
     params: tuple = ()
@@ -213,12 +222,8 @@ def load_version(
 def load_production(
     pool, store: ObjectStore, name: str
 ) -> tuple[XGBRegressor, ModelVersion]:
-    with pool.connection() as conn:
-        row = conn.execute(
-            _SELECT_COLUMNS + " WHERE name = %s AND stage = 'production'", (name,)
-        ).fetchone()
-    if row is None:
+    record = get_production(pool, name)
+    if record is None:
         raise ModelNotFound(f"no production version for {name}")
 
-    record = _row_to_model(row)
     return _load_record(store, record), record

@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     performance_min_samples: int = Field(default=20, ge=1)
     performance_mae_warn: float = Field(default=90.0, gt=0)
     performance_mae_fail: float = Field(default=120.0, gt=0)
+    # Relative holdout-MAE improvement a candidate needs to be promotable.
+    promotion_min_improvement: float = Field(default=0.02, ge=0.0, lt=1.0)
 
 
 @lru_cache(maxsize=1)
