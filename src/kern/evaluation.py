@@ -99,6 +99,10 @@ def run_retention(pool, days: int) -> dict:
             "AND resolved_at IS NOT NULL "
             "AND resolved_at < now() - make_interval(days => %s)"
         ),
+        "shadow_predictions": (
+            "DELETE FROM shadow_predictions "
+            "WHERE recorded_at < now() - make_interval(days => %s)"
+        ),
     }
 
     deleted: dict[str, int] = {}

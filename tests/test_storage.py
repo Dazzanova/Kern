@@ -13,6 +13,8 @@ EXPECTED_TABLES = {
     "drift_checks",
     "incidents",
     "promotion_decisions",
+    "shadow_assignments",
+    "shadow_predictions",
 }
 
 

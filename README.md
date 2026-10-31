@@ -14,7 +14,7 @@ reduce model incidents while maintaining inference performance.
 - ✅ Phase 1 — Baseline model serving
 - ✅ Phase 2 — Observability core
 - ✅ Phase 3 — Close the loop and drift detection
-- 🚧 Phase 4 — From observation to action (detection loop and promotion gate done)
+- 🚧 Phase 4 — From observation to action (detection loop, promotion gate, and shadow evaluation done)
 
 Phase 2 adds a versioned model registry, per-request telemetry, and data-quality
 monitoring. Phase 3 makes promotion take effect without a restart, records forecast
@@ -73,6 +73,10 @@ uv run uvicorn src.kern.serving.app:app
 | GET | `/models` | Registered versions and stages |
 | GET | `/models/{name}/{version}` | Full version metadata |
 | POST | `/models/{name}/{version}/promote` | Policy-checked promote and hot-swap; `?force=true` overrides |
+| POST | `/models/{name}/{version}/shadow` | Attach a candidate to score live traffic without serving it |
+| GET | `/shadow` | Current shadow assignment |
+| DELETE | `/shadow` | Detach the shadow |
+| GET | `/shadow/report?window=24h` | Agreement and outcome MAE for production vs shadow |
 | POST | `/outcomes` | Upsert observed load for a target hour |
 | GET | `/telemetry/summary?window=1h` | Request counts, latency percentiles, dropped events |
 | GET | `/quality/report?window=1h` | Per-feature data-quality checks |
@@ -96,6 +100,12 @@ for the model. Every attempt, including refusals and `?force=true` overrides, is
 `uv run python scripts/train_candidate.py --version <name>`; it registers but does not
 promote.
 
+A shadow candidate predicts on every served request without changing the response. Its
+predictions land in `shadow_predictions`, and `/shadow/report` pairs them with production
+by `request_id`: agreement first, then each model's MAE on the same outcomes once they
+arrive. A verdict needs at least `KERN_SHADOW_MIN_SAMPLES` (default 20) paired outcomes.
+Promoting the shadowed version detaches it automatically.
+
 Batch telemetry carries one feature snapshot for up to 256 rows, so batch predictions do
 not record a `target_ts` and are excluded from `/performance/report`. Drift checks skip
 calendar features (`hour`, `month`, …) because they are deterministic given the target
@@ -116,7 +126,7 @@ tests that need no infrastructure.
 - [x] Drift detection
 - [x] Candidate training and promotion gate
 - [ ] Automated retraining
-- [ ] Shadow evaluation
+- [x] Shadow evaluation
 - [ ] Canary deployment
 - [ ] Automated rollback
 - [ ] Predictive autoscaling

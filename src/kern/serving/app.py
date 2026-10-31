@@ -14,11 +14,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from xgboost import XGBRegressor
 
-from kern import evaluation, policy, reports
+from kern import evaluation, policy, reports, shadow
 from kern.config import get_settings
 from kern.data.features import build_features
 from kern.registry import (
     ModelNotFound,
+    ModelVersion,
     RegistryError,
     get_production,
     get_version,
@@ -90,6 +91,44 @@ class ModelState:
     reference_sample: dict[str, list[float]] | None
 
 
+def _load_shadow(
+    pool, store, model_name: str, production: ModelVersion
+) -> ModelState | None:
+    """Restore the persisted shadow, clearing an assignment that cannot be served."""
+    version = shadow.get_assignment(pool, model_name)
+    if version is None:
+        return None
+
+    def clear(reason: str) -> None:
+        logger.warning("clearing shadow %s %s: %s", model_name, version, reason)
+        try:
+            shadow.detach(pool, model_name)
+        except Exception:
+            logger.exception("failed to clear the shadow assignment")
+
+    if version == production.version:
+        clear("it is already the production version")
+        return None
+
+    try:
+        model, record = load_version(pool, store, model_name, version)
+    except (ModelNotFound, RegistryError) as error:
+        clear(str(error))
+        return None
+
+    if record.feature_schema != production.feature_schema:
+        clear("feature schema differs from production")
+        return None
+
+    return ModelState(
+        name=record.name,
+        version=record.version,
+        model=model,
+        reference_profile=record.reference_profile,
+        reference_sample=record.reference_sample,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -122,8 +161,16 @@ async def lifespan(app: FastAPI):
         )
         app.state.recorder = recorder
         app.state.writer = writer
+        app.state.shadow = _load_shadow(pool, store, settings.model_name, record)
+        shadow_recorder = shadow.ShadowRecorder(
+            queue_size=settings.telemetry_queue_size
+        )
+        shadow_writer = shadow.ShadowWriter(pool, shadow_recorder)
+        app.state.shadow_recorder = shadow_recorder
+        app.state.shadow_writer = shadow_writer
         app.state.last_retention = None
         writer.start()
+        shadow_writer.start()
 
         if settings.evaluation_interval > 0:
             runner = evaluation.EvaluationRunner(app)
@@ -148,6 +195,7 @@ async def lifespan(app: FastAPI):
         if runner is not None:
             runner.stop()
         writer.stop()
+        shadow_writer.stop()
         pool.close()
 
 
@@ -235,6 +283,50 @@ def _record(
         logger.exception("failed to record telemetry for %s", request_id)
 
 
+def _shadow_predict(
+    app: FastAPI,
+    *,
+    current: ModelState,
+    request_id: str,
+    endpoint: str,
+    features: pd.DataFrame,
+    batch_size: int,
+    target_ts: datetime | None = None,
+) -> None:
+    """Predict with the shadow and enqueue the result.
+
+    Runs after the production response is built. Any failure here is logged and
+    swallowed: a comparison is never worth failing a served prediction.
+    """
+    shadow_state = getattr(app.state, "shadow", None)
+    if shadow_state is None:
+        return
+
+    try:
+        start = perf_counter()
+        predictions = shadow_state.model.predict(features)
+        duration_ms = (perf_counter() - start) * 1000
+        predictions = np.nan_to_num(predictions, nan=0.0, posinf=0.0, neginf=0.0)
+
+        app.state.shadow_recorder.record(
+            shadow.ShadowEvent(
+                request_id=request_id,
+                model_name=shadow_state.name,
+                model_version=shadow_state.version,
+                production_version=current.version,
+                endpoint=endpoint,
+                batch_size=batch_size,
+                duration_ms=duration_ms,
+                prediction_min=float(predictions.min()),
+                prediction_mean=float(predictions.mean()),
+                prediction_max=float(predictions.max()),
+                target_ts=target_ts,
+            )
+        )
+    except Exception:
+        logger.exception("shadow prediction failed for request %s", request_id)
+
+
 @app.post("/predict", response_model=PredictionResponse)
 def predict(payload: PredictionRequest, request: Request):
     request_id = str(uuid4())
@@ -262,6 +354,16 @@ def predict(payload: PredictionRequest, request: Request):
         duration_ms=latency_ms,
         predictions=np.asarray([prediction]),
         feature_frame=features,
+        target_ts=target_ts,
+    )
+
+    _shadow_predict(
+        request.app,
+        current=current,
+        request_id=request_id,
+        endpoint="predict",
+        features=features,
+        batch_size=1,
         target_ts=target_ts,
     )
 
@@ -305,6 +407,15 @@ def predict_batch(payload: BatchPredictionRequest, request: Request):
         duration_ms=processing_time_ms,
         predictions=predictions,
         feature_frame=features,
+    )
+
+    _shadow_predict(
+        request.app,
+        current=current,
+        request_id=request_id,
+        endpoint="predict/batch",
+        features=features,
+        batch_size=len(payload.records),
     )
 
     return BatchPredictionResponse(
@@ -442,6 +553,14 @@ def promote_model(name: str, version: str, request: Request, force: bool = False
             detail=f"{name} {version} promoted in the registry but not loaded into this process",
         ) from None
 
+    if state.shadow is not None and state.shadow.version == promoted.version:
+        state.shadow = None
+        try:
+            shadow.detach(state.pool, name)
+        except Exception:
+            # The row is stale but harmless: startup clears a self-assignment.
+            logger.exception("failed to clear shadow assignment for %s %s", name, version)
+
     recorded = "forced" if force and not decision.allowed else "allowed"
     policy.record_decision(
         state.pool,
@@ -460,6 +579,62 @@ def promote_model(name: str, version: str, request: Request, force: bool = False
         "decision": recorded,
         "reasons": decision.reasons,
         "promoted_at": promoted.promoted_at.isoformat() if promoted.promoted_at else None,
+    }
+
+
+@app.post("/models/{name}/{version}/shadow", dependencies=[Depends(_require_token)])
+def attach_shadow(name: str, version: str, request: Request):
+    state = request.app.state
+    production = get_production(state.pool, name)
+    if production is None:
+        raise HTTPException(status_code=404, detail=f"no production version for {name}")
+    if production.version == version:
+        raise HTTPException(
+            status_code=409, detail="the production version cannot shadow itself"
+        )
+
+    try:
+        model, record = load_version(state.pool, state.store, name, version)
+    except ModelNotFound as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except RegistryError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+    if record.feature_schema != production.feature_schema:
+        raise HTTPException(
+            status_code=409,
+            detail="shadow feature schema differs from production; it cannot be evaluated",
+        )
+
+    assignment = shadow.attach(state.pool, model_name=name, version=version)
+    state.shadow = ModelState(
+        name=record.name,
+        version=record.version,
+        model=model,
+        reference_profile=record.reference_profile,
+        reference_sample=record.reference_sample,
+    )
+    return {
+        "model_name": name,
+        "shadow_version": record.version,
+        "attached_at": assignment["attached_at"].isoformat(),
+    }
+
+
+@app.delete("/shadow", dependencies=[Depends(_require_token)])
+def detach_shadow(request: Request):
+    name = request.app.state.settings.model_name
+    cleared = shadow.detach(request.app.state.pool, name)
+    request.app.state.shadow = None
+    return {"model_name": name, "cleared": cleared}
+
+
+@app.get("/shadow")
+def get_shadow(request: Request):
+    name = request.app.state.settings.model_name
+    return {
+        "model_name": name,
+        "shadow_version": shadow.get_assignment(request.app.state.pool, name),
     }
 
 
@@ -580,6 +755,26 @@ def list_incidents(request: Request, status: str = "open", limit: int = 100):
 @app.post("/evaluate", dependencies=[Depends(_require_token)])
 def evaluate_now(request: Request):
     return evaluation.run_scheduled(request.app)
+
+
+@app.get("/shadow/report")
+def shadow_report(request: Request, window: str = "24h"):
+    try:
+        delta = parse_window(window)
+    except (ValueError, OverflowError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    state = request.app.state
+    production = get_production(state.pool, state.settings.model_name)
+    return shadow.build_report(
+        state.pool,
+        model_name=state.settings.model_name,
+        shadow_version=shadow.get_assignment(state.pool, state.settings.model_name),
+        production_version=production.version if production else None,
+        window=window,
+        since=datetime.now(timezone.utc) - delta,
+        min_samples=state.settings.shadow_min_samples,
+    )
 
 
 @app.get("/telemetry/summary")

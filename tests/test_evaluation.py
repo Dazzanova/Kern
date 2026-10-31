@@ -147,3 +147,28 @@ def test_retention_deletes_only_old_rows_and_never_open_incidents(pg):
 
 def test_retention_is_a_no_op_when_disabled(pg):
     assert run_retention(pg, 0) == {}
+
+
+def test_retention_deletes_old_shadow_predictions_but_never_assignments(pg):
+    with pg.connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO shadow_predictions (
+                request_id, model_name, model_version, production_version,
+                endpoint, batch_size, duration_ms, recorded_at
+            ) VALUES
+                (gen_random_uuid(), 'm', 'v', 'p', 'predict', 1, 1.0,
+                 now() - interval '40 days'),
+                (gen_random_uuid(), 'm', 'v', 'p', 'predict', 1, 1.0, now())
+            """
+        )
+        conn.execute(
+            "INSERT INTO shadow_assignments (model_name, version) VALUES ('m', 'v')"
+        )
+
+    deleted = run_retention(pg, 30)
+
+    assert deleted["shadow_predictions"] == 1
+    with pg.connection() as conn:
+        assert conn.execute("SELECT count(*) FROM shadow_predictions").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM shadow_assignments").fetchone()[0] == 1

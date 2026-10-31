@@ -782,3 +782,194 @@ def test_open_critical_incident_blocks_an_otherwise_better_candidate(
 
         promote_version(pg, name="load-forecast", version=baseline_model)
         _drop_version(pg, "test-gated")
+
+
+def test_shadow_attach_get_and_detach(pg, store, baseline_model, tmp_path):
+    _register_version(pg, store, tmp_path, "test-shadow")
+
+    try:
+        with TestClient(app) as client:
+            attached = client.post("/models/load-forecast/test-shadow/shadow")
+            assert attached.status_code == 200
+            assert attached.json()["shadow_version"] == "test-shadow"
+
+            current = client.get("/shadow").json()
+            assert current["shadow_version"] == "test-shadow"
+
+            assert client.delete("/shadow").json()["cleared"] is True
+            assert client.delete("/shadow").json()["cleared"] is False
+            assert client.get("/shadow").json()["shadow_version"] is None
+    finally:
+        _drop_version(pg, "test-shadow")
+
+
+def test_shadow_rejects_the_production_version(baseline_model):
+    with TestClient(app) as client:
+        response = client.post(f"/models/load-forecast/{baseline_model}/shadow")
+
+    assert response.status_code == 409
+    assert "cannot shadow itself" in response.json()["detail"]
+
+
+def test_shadow_rejects_an_unknown_version(baseline_model):
+    with TestClient(app) as client:
+        assert client.post("/models/load-forecast/nope/shadow").status_code == 404
+
+
+def _register_narrow_version(pg, store, tmp_path, version):
+    """A self-consistent artifact trained on a different feature set."""
+    import pandas as pd
+    from xgboost import XGBRegressor
+
+    from kern.data.generate import generate_dataset
+    from kern.quality import profile_reference
+    from kern.registry import register
+
+    df = generate_dataset("2025-01-01", 100, 3)
+    X = pd.DataFrame({"temperature_c": df["temperature_c"]})
+    model = XGBRegressor(n_estimators=5, max_depth=2, random_state=3)
+    model.fit(X, df["load_mw"])
+
+    path = tmp_path / f"{version}.json"
+    model.save_model(path)
+
+    return register(
+        pg,
+        store,
+        name="load-forecast",
+        version=version,
+        artifact_path=path,
+        metrics={"mae": 1.0},
+        feature_schema=["temperature_c"],
+        reference_profile=profile_reference(X, ["temperature_c"]),
+    )
+
+
+def test_shadow_rejects_a_different_feature_schema(pg, store, baseline_model, tmp_path):
+    _register_narrow_version(pg, store, tmp_path, "test-narrow")
+
+    try:
+        with TestClient(app) as client:
+            response = client.post("/models/load-forecast/test-narrow/shadow")
+
+        assert response.status_code == 409
+        assert "feature schema differs" in response.json()["detail"]
+    finally:
+        _drop_version(pg, "test-narrow")
+
+
+def test_shadowed_predict_serves_production_and_records_the_candidate(
+    pg, store, baseline_model, tmp_path
+):
+    _register_version(pg, store, tmp_path, "test-shadow-predict")
+
+    try:
+        with TestClient(app) as client:
+            assert (
+                client.post("/models/load-forecast/test-shadow-predict/shadow").status_code
+                == 200
+            )
+
+            single = client.post("/predict", json=PAYLOAD)
+            assert single.status_code == 200
+            assert single.json()["model_version"] == baseline_model
+
+            batch = client.post(
+                "/predict/batch",
+                json={
+                    "records": [
+                        PAYLOAD,
+                        {**PAYLOAD, "timestamp": "2025-04-01T13:00:00"},
+                    ]
+                },
+            )
+            assert batch.status_code == 200
+
+            # Stop the writer so the final drain is deterministic before reading.
+            client.app.state.shadow_writer.stop()
+
+            with pg.connection() as conn:
+                rows = conn.execute(
+                    "SELECT model_version, production_version, endpoint, target_ts "
+                    "FROM shadow_predictions ORDER BY id"
+                ).fetchall()
+
+        assert [(row[0], row[1], row[2]) for row in rows] == [
+            ("test-shadow-predict", baseline_model, "predict"),
+            ("test-shadow-predict", baseline_model, "predict/batch"),
+        ]
+        assert rows[0][3] is not None
+        assert rows[1][3] is None
+    finally:
+        _drop_version(pg, "test-shadow-predict")
+
+
+def test_shadow_failure_does_not_fail_a_prediction(baseline_model):
+    from kern.serving.app import ModelState
+
+    class Boom:
+        def predict(self, features):
+            raise RuntimeError("shadow exploded")
+
+    with TestClient(app) as client:
+        client.app.state.shadow = ModelState(
+            name="x",
+            version="x",
+            model=Boom(),
+            reference_profile={},
+            reference_sample=None,
+        )
+        response = client.post("/predict", json=PAYLOAD)
+
+        with client.app.state.pool.connection() as conn:
+            count = conn.execute("SELECT count(*) FROM shadow_predictions").fetchone()[0]
+
+    assert response.status_code == 200
+    assert response.json()["model_version"] == baseline_model
+    assert count == 0
+
+
+def test_promoting_the_shadow_detaches_it(pg, store, baseline_model, tmp_path):
+    _register_version(pg, store, tmp_path, "test-shadow-promote", metrics={"mae": 1.0})
+
+    try:
+        with TestClient(app) as client:
+            client.post("/models/load-forecast/test-shadow-promote/shadow")
+
+            response = client.post("/models/load-forecast/test-shadow-promote/promote")
+            assert response.status_code == 200
+            assert (
+                client.get("/shadow").json()["shadow_version"]
+                is None
+            )
+
+        with pg.connection() as conn:
+            assert conn.execute("SELECT count(*) FROM shadow_assignments").fetchone()[0] == 0
+    finally:
+        from kern.registry import promote as promote_version
+
+        promote_version(pg, name="load-forecast", version=baseline_model)
+        _drop_version(pg, "test-shadow-promote")
+
+
+def test_shadow_report_without_an_assignment(baseline_model):
+    with TestClient(app) as client:
+        response = client.get("/shadow/report")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["shadow_version"] is None
+    assert body["paired_samples"] == 0
+    assert body["verdict"] == "inconclusive"
+
+
+def test_shadow_endpoints_require_the_token(baseline_model):
+    with TestClient(app) as client:
+        client.app.state.settings.api_token = "s3cret"
+        try:
+            assert client.post(
+                f"/models/load-forecast/{baseline_model}/shadow"
+            ).status_code == 401
+            assert client.delete("/shadow").status_code == 401
+        finally:
+            client.app.state.settings.api_token = ""
