@@ -103,6 +103,10 @@ def run_retention(pool, days: int) -> dict:
             "DELETE FROM shadow_predictions "
             "WHERE recorded_at < now() - make_interval(days => %s)"
         ),
+        "scaling_plans": (
+            "DELETE FROM scaling_plans "
+            "WHERE created_at < now() - make_interval(days => %s)"
+        ),
     }
 
     deleted: dict[str, int] = {}

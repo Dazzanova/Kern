@@ -45,7 +45,7 @@ def clean_telemetry_rows(request):
             "TRUNCATE prediction_events, quality_checks, observed_outcomes, "
             "drift_checks, incidents, promotion_decisions, "
             "shadow_predictions, shadow_assignments, canary_assignments, "
-            "rollback_events, retraining_runs RESTART IDENTITY"
+            "rollback_events, retraining_runs, scaling_plans RESTART IDENTITY"
         )
 
 

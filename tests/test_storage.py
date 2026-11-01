@@ -18,6 +18,7 @@ EXPECTED_TABLES = {
     "canary_assignments",
     "rollback_events",
     "retraining_runs",
+    "scaling_plans",
 }
 
 

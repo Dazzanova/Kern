@@ -55,6 +55,23 @@ class Settings(BaseSettings):
     retrain_holdout_fraction: float = Field(default=0.2, gt=0.0, lt=1.0)
     # Minimum hours between automatic retraining decisions for a model; 0 disables.
     retrain_cooldown_hours: float = Field(default=24.0, ge=0)
+    # Predictive capacity planning from serving telemetry.
+    scaling_enabled: bool = True
+    # How far ahead the plan forecasts.
+    scaling_horizon_minutes: int = Field(default=60, ge=1)
+    # Bucket size for history and forecast.
+    scaling_step_minutes: int = Field(default=5, ge=1)
+    # History used by the forecast.
+    scaling_lookback_minutes: int = Field(default=60, ge=1)
+    # Non-empty buckets required before recommending.
+    scaling_min_buckets: int = Field(default=3, ge=1)
+    # Sustainable request rate of one serving replica; hardware-dependent.
+    scaling_rps_per_replica: float = Field(default=90.0, gt=0)
+    # Share of replica capacity the plan may consume.
+    scaling_target_utilization: float = Field(default=0.7, gt=0, le=1)
+    # Floor and ceiling for every recommendation.
+    scaling_min_replicas: int = Field(default=1, ge=1)
+    scaling_max_replicas: int = Field(default=10, ge=1)
 
 
 @lru_cache(maxsize=1)

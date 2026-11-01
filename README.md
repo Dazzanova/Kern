@@ -14,7 +14,7 @@ reduce model incidents while maintaining inference performance.
 - ✅ Phase 1 — Baseline model serving
 - ✅ Phase 2 — Observability core
 - ✅ Phase 3 — Close the loop and drift detection
-- 🚧 Phase 4 — From observation to action (detection loop, promotion gate, shadow evaluation, canary deployment, automated rollback, and automated retraining done)
+- 🚧 Phase 4 — From observation to action (detection loop, promotion gate, shadow evaluation, canary deployment, automated rollback, automated retraining, and capacity planning done)
 
 Phase 2 adds a versioned model registry, per-request telemetry, and data-quality
 monitoring. Phase 3 makes promotion take effect without a restart, records forecast
@@ -23,6 +23,8 @@ feature distributions against a stored reference sample using PSI and KS. Phase 
 lifecycle. Kern now acts on that evidence, but only within bounded policies: promotion is
 gated, rollback reverts a recent promotion after a critical performance incident, and
 retraining turns the same labeled traffic into a new candidate without touching production.
+A capacity planner forecasts serving demand from recent traffic and recommends how many
+replicas the next hour needs, but it never scales anything itself.
 
 ## Batch Inference
 
@@ -85,6 +87,8 @@ uv run uvicorn src.kern.serving.app:app
 | GET | `/rollbacks?limit=20` | Recent rollback decisions, including refusals |
 | POST | `/retrain` | Train and register a candidate from labeled live traffic |
 | GET | `/retrain/runs?limit=20` | Recent retraining decisions, including skips and failures |
+| GET | `/scaling/plan` | Latest capacity plan and its recommendation |
+| GET | `/scaling/plans?limit=20` | Recent capacity plans, newest first |
 | POST | `/outcomes` | Upsert observed load for a target hour |
 | GET | `/telemetry/summary?window=1h` | Request counts, latency percentiles, dropped events |
 | GET | `/quality/report?window=1h` | Per-feature data-quality checks |
@@ -151,6 +155,21 @@ and is exposed by `GET /retrain/runs`; `POST /retrain` runs the same attempt man
 Feature snapshots are sampled at `KERN_FEATURE_SAMPLE_RATE` (default 5%), so deployments
 that retrain regularly should raise it.
 
+The same post-cycle hook produces an advisory capacity plan. Serving requests from
+`prediction_events` are counted into completed `KERN_SCALING_STEP_MINUTES` (default 5)
+buckets over `KERN_SCALING_LOOKBACK_MINUTES` (default 60); the current partial bucket is
+ignored so a half-finished interval cannot look like a traffic drop. The bucket series is
+smoothed with Holt's linear trend and projected `KERN_SCALING_HORIZON_MINUTES` (default 60)
+ahead. Peak forecast RPS is sized with
+`ceil(rps / (KERN_SCALING_RPS_PER_REPLICA × KERN_SCALING_TARGET_UTILIZATION))`, clamped to
+`KERN_SCALING_MIN_REPLICAS` / `KERN_SCALING_MAX_REPLICAS` (defaults 1 / 10). Per-replica
+capacity defaults to 90 req/s and utilization to 0.7; both are deployment-specific. Fewer
+than `KERN_SCALING_MIN_BUCKETS` (default 3) non-empty buckets yields an `insufficient_data`
+plan rather than a guess. Plans are stored in `scaling_plans`, exposed by `/scaling/plan`,
+`/scaling/plans`, and the `scaling` field of `/evaluate`, and pruned with retention.
+`KERN_SCALING_ENABLED=false` disables planning. The recommendation is advisory: Kern does
+not call Kubernetes, Compose, or any process manager.
+
 Batch telemetry carries one feature snapshot for up to 256 rows, so batch predictions do
 not record a `target_ts` and are excluded from `/performance/report`. Drift checks skip
 calendar features (`hour`, `month`, …) because they are deterministic given the target
@@ -174,5 +193,5 @@ tests that need no infrastructure.
 - [x] Shadow evaluation
 - [x] Canary deployment
 - [x] Automated rollback
-- [ ] Predictive autoscaling
+- [x] Predictive autoscaling
 - [ ] Reliability benchmarks

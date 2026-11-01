@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from xgboost import XGBRegressor
 
-from kern import canary, evaluation, policy, reports, retraining, rollback, shadow
+from kern import canary, evaluation, policy, reports, retraining, rollback, scaling, shadow
 from kern.config import get_settings
 from kern.data.features import build_features
 from kern.registry import (
@@ -471,10 +471,21 @@ def run_retraining(app: FastAPI, *, trigger: str = "automatic") -> dict | None:
     )
 
 
+def run_capacity_plan(app: FastAPI) -> dict | None:
+    """Build and persist one advisory capacity plan for the serving model."""
+    state = app.state
+    return scaling.plan_and_record(
+        state.pool,
+        model_name=state.settings.model_name,
+        settings=state.settings,
+    )
+
+
 def run_after_cycle(app: FastAPI) -> None:
-    """Post-cycle recovery: restore production first, then learn from the episode."""
+    """Post-cycle recovery: restore production, learn from the episode, plan capacity."""
     run_rollback(app, trigger="automatic")
     run_retraining(app, trigger="automatic")
+    run_capacity_plan(app)
 
 
 @app.post("/predict", response_model=PredictionResponse)
@@ -1033,6 +1044,7 @@ def evaluate_now(request: Request):
     result = evaluation.run_scheduled(request.app)
     result["rollback"] = run_rollback(request.app, trigger="automatic")
     result["retraining"] = run_retraining(request.app, trigger="automatic")
+    result["scaling"] = run_capacity_plan(request.app)
     return result
 
 
@@ -1093,6 +1105,28 @@ def list_retraining_runs(request: Request, limit: int = 20):
     return {
         "model_name": state.settings.model_name,
         "runs": retraining.list_runs(
+            state.pool,
+            state.settings.model_name,
+            limit=max(1, min(limit, 100)),
+        ),
+    }
+
+
+@app.get("/scaling/plan")
+def latest_scaling_plan(request: Request):
+    state = request.app.state
+    plan = scaling.latest_plan(state.pool, state.settings.model_name)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="no capacity plan yet")
+    return plan
+
+
+@app.get("/scaling/plans")
+def list_scaling_plans(request: Request, limit: int = 20):
+    state = request.app.state
+    return {
+        "model_name": state.settings.model_name,
+        "plans": scaling.list_plans(
             state.pool,
             state.settings.model_name,
             limit=max(1, min(limit, 100)),
