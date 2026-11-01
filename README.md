@@ -14,7 +14,7 @@ reduce model incidents while maintaining inference performance.
 - ✅ Phase 1 — Baseline model serving
 - ✅ Phase 2 — Observability core
 - ✅ Phase 3 — Close the loop and drift detection
-- 🚧 Phase 4 — From observation to action (detection loop, promotion gate, and shadow evaluation done)
+- 🚧 Phase 4 — From observation to action (detection loop, promotion gate, shadow evaluation, and canary deployment done)
 
 Phase 2 adds a versioned model registry, per-request telemetry, and data-quality
 monitoring. Phase 3 makes promotion take effect without a restart, records forecast
@@ -77,6 +77,10 @@ uv run uvicorn src.kern.serving.app:app
 | GET | `/shadow` | Current shadow assignment |
 | DELETE | `/shadow` | Detach the shadow |
 | GET | `/shadow/report?window=24h` | Agreement and outcome MAE for production vs shadow |
+| POST | `/models/{name}/{version}/canary?fraction=0.1` | Serve a fraction of traffic from a candidate |
+| GET | `/canary` | Current canary assignment and fraction |
+| DELETE | `/canary` | Detach the canary |
+| GET | `/canary/report?window=24h` | Served split, fallbacks, and outcome MAE for both versions |
 | POST | `/outcomes` | Upsert observed load for a target hour |
 | GET | `/telemetry/summary?window=1h` | Request counts, latency percentiles, dropped events |
 | GET | `/quality/report?window=1h` | Per-feature data-quality checks |
@@ -86,7 +90,8 @@ uv run uvicorn src.kern.serving.app:app
 | POST | `/evaluate` | Run one detection cycle immediately |
 
 `KERN_API_TOKEN`, when set, is required as `Authorization: Bearer <token>` on promotion,
-`/outcomes`, and `/evaluate`. When unset they are open and startup logs a warning.
+shadow/canary attach and detach, `/outcomes`, and `/evaluate`. When unset they are open and
+startup logs a warning.
 
 The detection loop evaluates quality, drift, and performance every
 `KERN_EVALUATION_INTERVAL` seconds (default 300; `0` disables it) and records breaches as
@@ -105,6 +110,17 @@ predictions land in `shadow_predictions`, and `/shadow/report` pairs them with p
 by `request_id`: agreement first, then each model's MAE on the same outcomes once they
 arrive. A verdict needs at least `KERN_SHADOW_MIN_SAMPLES` (default 20) paired outcomes.
 Promoting the shadowed version detaches it automatically.
+
+A canary serves a candidate to a fraction of requests while production answers the rest.
+The fraction must be strictly between 0 and 1: serving everything is a promotion, and
+pausing is a detach. A canary failure falls back to production, keeps the response `200`,
+and is marked `canary_fallback` and counted in `/canary/report`. Because a canary answer
+is a served answer, it lives in `prediction_events` under the canary's version, so the
+production quality, drift, and performance reports still describe only what production
+served. The report compares disjoint samples and needs `KERN_CANARY_MIN_SAMPLES` (default
+20) outcomes on each side before issuing a verdict. Shadow and canary are mutually
+exclusive: attaching one clears the other and reports which. Promoting the canary detaches
+it automatically.
 
 Batch telemetry carries one feature snapshot for up to 256 rows, so batch predictions do
 not record a `target_ts` and are excluded from `/performance/report`. Drift checks skip
@@ -127,7 +143,7 @@ tests that need no infrastructure.
 - [x] Candidate training and promotion gate
 - [ ] Automated retraining
 - [x] Shadow evaluation
-- [ ] Canary deployment
+- [x] Canary deployment
 - [ ] Automated rollback
 - [ ] Predictive autoscaling
 - [ ] Reliability benchmarks

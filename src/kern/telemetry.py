@@ -27,6 +27,8 @@ class PredictionEvent:
     # The timestamp the prediction is *for*. Null for batch requests, where one
     # event covers up to 256 different target hours and cannot be attributed.
     target_ts: datetime | None = None
+    # True when the canary was selected but failed and production answered instead.
+    canary_fallback: bool = False
 
 
 class TelemetryRecorder:
@@ -84,8 +86,8 @@ _INSERT = """
 INSERT INTO prediction_events (
     request_id, model_name, model_version, endpoint, batch_size,
     duration_ms, prediction_min, prediction_mean, prediction_max, features,
-    target_ts
-) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    target_ts, canary_fallback
+) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
 
 
@@ -151,6 +153,7 @@ class TelemetryWriter:
                 event.prediction_max,
                 Jsonb(event.features) if event.features is not None else None,
                 event.target_ts,
+                event.canary_fallback,
             )
             for event in batch
         ]

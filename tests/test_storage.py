@@ -15,6 +15,7 @@ EXPECTED_TABLES = {
     "promotion_decisions",
     "shadow_assignments",
     "shadow_predictions",
+    "canary_assignments",
 }
 
 

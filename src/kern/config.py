@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     promotion_min_improvement: float = Field(default=0.02, ge=0.0, lt=1.0)
     # Paired outcomes required before /shadow/report issues a verdict.
     shadow_min_samples: int = Field(default=20, ge=1)
+    # Paired outcomes required on both sides before /canary/report issues a verdict.
+    canary_min_samples: int = Field(default=20, ge=1)
 
 
 @lru_cache(maxsize=1)

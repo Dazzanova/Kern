@@ -1,5 +1,6 @@
 import logging
 import math
+import random
 import secrets
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from xgboost import XGBRegressor
 
-from kern import evaluation, policy, reports, shadow
+from kern import canary, evaluation, policy, reports, shadow
 from kern.config import get_settings
 from kern.data.features import build_features
 from kern.registry import (
@@ -129,6 +130,49 @@ def _load_shadow(
     )
 
 
+def _load_canary(
+    pool, store, model_name: str, production: ModelVersion
+) -> tuple[ModelState | None, float | None]:
+    """Restore the persisted canary, clearing an assignment that cannot be served."""
+    assignment = canary.get_assignment(pool, model_name)
+    if assignment is None:
+        return None, None
+
+    version = assignment["version"]
+
+    def clear(reason: str) -> None:
+        logger.warning("clearing canary %s %s: %s", model_name, version, reason)
+        try:
+            canary.detach(pool, model_name)
+        except Exception:
+            logger.exception("failed to clear the canary assignment")
+
+    if version == production.version:
+        clear("it is already the production version")
+        return None, None
+
+    try:
+        model, record = load_version(pool, store, model_name, version)
+    except (ModelNotFound, RegistryError) as error:
+        clear(str(error))
+        return None, None
+
+    if record.feature_schema != production.feature_schema:
+        clear("feature schema differs from production")
+        return None, None
+
+    return (
+        ModelState(
+            name=record.name,
+            version=record.version,
+            model=model,
+            reference_profile=record.reference_profile,
+            reference_sample=record.reference_sample,
+        ),
+        assignment["fraction"],
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -162,6 +206,21 @@ async def lifespan(app: FastAPI):
         app.state.recorder = recorder
         app.state.writer = writer
         app.state.shadow = _load_shadow(pool, store, settings.model_name, record)
+        canary_state, canary_fraction = _load_canary(
+            pool, store, settings.model_name, record
+        )
+        if canary_state is not None and app.state.shadow is not None:
+            logger.warning(
+                "shadow and canary are both assigned; keeping the canary"
+            )
+            try:
+                shadow.detach(pool, settings.model_name)
+            except Exception:
+                logger.exception("failed to clear the stray shadow assignment")
+            app.state.shadow = None
+        app.state.canary = canary_state
+        app.state.canary_fraction = canary_fraction
+        app.state.canary_rng = random.random
         shadow_recorder = shadow.ShadowRecorder(
             queue_size=settings.telemetry_queue_size
         )
@@ -178,8 +237,9 @@ async def lifespan(app: FastAPI):
 
         if not settings.api_token:
             logger.warning(
-                "KERN_API_TOKEN is unset: /models/*/promote and /outcomes are "
-                "unauthenticated; set it before exposing this service"
+                "KERN_API_TOKEN is unset: /models/*/promote, /models/*/shadow, "
+                "/models/*/canary, and /outcomes are unauthenticated; set it "
+                "before exposing this service"
             )
     except Exception as error:
         if pool is not None:
@@ -243,7 +303,7 @@ def ready(request: Request):
 
 def _record(
     app: FastAPI,
-    current: ModelState,
+    served: ModelState,
     *,
     request_id: str,
     endpoint: str,
@@ -252,6 +312,7 @@ def _record(
     predictions: np.ndarray,
     feature_frame: pd.DataFrame,
     target_ts: datetime | None = None,
+    canary_fallback: bool = False,
 ) -> None:
     """Hand off telemetry without blocking the request.
 
@@ -268,7 +329,7 @@ def _record(
             PredictionEvent(
                 request_id=request_id,
                 model_name=app.state.settings.model_name,
-                model_version=current.version,
+                model_version=served.version,
                 endpoint=endpoint,
                 batch_size=batch_size,
                 duration_ms=duration_ms,
@@ -277,6 +338,7 @@ def _record(
                 prediction_max=float(predictions.max()),
                 features=snapshot,
                 target_ts=target_ts,
+                canary_fallback=canary_fallback,
             )
         )
     except Exception:
@@ -327,6 +389,36 @@ def _shadow_predict(
         logger.exception("shadow prediction failed for request %s", request_id)
 
 
+def _predict_with_canary(
+    app: FastAPI, features: pd.DataFrame
+) -> tuple[ModelState, np.ndarray, bool]:
+    """Pick the model for this request and predict with it.
+
+    Returns the state that answered, its predictions, and whether a selected
+    canary failed and production answered instead. A canary may cost accuracy;
+    it may not cost availability.
+    """
+    current = app.state.current
+    canary_state = getattr(app.state, "canary", None)
+    fraction = getattr(app.state, "canary_fraction", None)
+    rng = getattr(app.state, "canary_rng", random.random)
+
+    if (
+        canary_state is None
+        or fraction is None
+        or not canary.should_use_canary(fraction, rng)
+    ):
+        return current, current.model.predict(features), False
+
+    try:
+        return canary_state, canary_state.model.predict(features), False
+    except Exception:
+        logger.exception(
+            "canary %s failed; falling back to production", canary_state.version
+        )
+        return current, current.model.predict(features), True
+
+
 @app.post("/predict", response_model=PredictionResponse)
 def predict(payload: PredictionRequest, request: Request):
     request_id = str(uuid4())
@@ -336,8 +428,9 @@ def predict(payload: PredictionRequest, request: Request):
     features = build_features(input_df)
 
     start = perf_counter()
-    prediction = current.model.predict(features)[0]
+    served, predictions, canary_fallback = _predict_with_canary(request.app, features)
     latency_ms = (perf_counter() - start) * 1000
+    prediction = predictions[0]
 
     # Naive input is read as UTC: the column is timestamptz and the training data
     # is UTC, so letting the session timezone decide would silently shift hours.
@@ -347,7 +440,7 @@ def predict(payload: PredictionRequest, request: Request):
 
     _record(
         request.app,
-        current,
+        served,
         request_id=request_id,
         endpoint="predict",
         batch_size=1,
@@ -355,6 +448,7 @@ def predict(payload: PredictionRequest, request: Request):
         predictions=np.asarray([prediction]),
         feature_frame=features,
         target_ts=target_ts,
+        canary_fallback=canary_fallback,
     )
 
     _shadow_predict(
@@ -369,10 +463,11 @@ def predict(payload: PredictionRequest, request: Request):
 
     return PredictionResponse(
         request_id=request_id,
-        model_version=current.version,
+        model_version=served.version,
         prediction_mw=float(prediction),
         inference_latency_ms=latency_ms,
     )
+
 
 
 @app.post("/predict/batch", response_model=BatchPredictionResponse)
@@ -388,7 +483,9 @@ def predict_batch(payload: BatchPredictionRequest, request: Request):
     features = build_features(input_df)
 
     # Single model call for the whole batch
-    predictions = current.model.predict(features)
+    served, predictions, canary_fallback = _predict_with_canary(
+        request.app, features
+    )
 
     # Ensure predictions are finite
     predictions = np.nan_to_num(predictions, nan=0.0, posinf=0.0, neginf=0.0)
@@ -400,13 +497,14 @@ def predict_batch(payload: BatchPredictionRequest, request: Request):
     # performance reporting by design.
     _record(
         request.app,
-        current,
+        served,
         request_id=request_id,
         endpoint="predict/batch",
         batch_size=len(payload.records),
         duration_ms=processing_time_ms,
         predictions=predictions,
         feature_frame=features,
+        canary_fallback=canary_fallback,
     )
 
     _shadow_predict(
@@ -420,7 +518,7 @@ def predict_batch(payload: BatchPredictionRequest, request: Request):
 
     return BatchPredictionResponse(
         request_id=request_id,
-        model_version=current.version,
+        model_version=served.version,
         batch_size=len(payload.records),
         total_processing_time_ms=processing_time_ms,
         predictions=[float(p) for p in predictions],
@@ -561,6 +659,15 @@ def promote_model(name: str, version: str, request: Request, force: bool = False
             # The row is stale but harmless: startup clears a self-assignment.
             logger.exception("failed to clear shadow assignment for %s %s", name, version)
 
+    if state.canary is not None and state.canary.version == promoted.version:
+        state.canary = None
+        state.canary_fraction = None
+        try:
+            canary.detach(state.pool, name)
+        except Exception:
+            # The row is stale but harmless: startup clears a self-assignment.
+            logger.exception("failed to clear canary assignment for %s %s", name, version)
+
     recorded = "forced" if force and not decision.allowed else "allowed"
     policy.record_decision(
         state.pool,
@@ -606,6 +713,11 @@ def attach_shadow(name: str, version: str, request: Request):
             detail="shadow feature schema differs from production; it cannot be evaluated",
         )
 
+    canary_cleared = canary.detach(state.pool, name)
+    if canary_cleared or getattr(state, "canary", None) is not None:
+        state.canary = None
+        state.canary_fraction = None
+
     assignment = shadow.attach(state.pool, model_name=name, version=version)
     state.shadow = ModelState(
         name=record.name,
@@ -618,6 +730,7 @@ def attach_shadow(name: str, version: str, request: Request):
         "model_name": name,
         "shadow_version": record.version,
         "attached_at": assignment["attached_at"].isoformat(),
+        "canary_cleared": canary_cleared,
     }
 
 
@@ -636,6 +749,111 @@ def get_shadow(request: Request):
         "model_name": name,
         "shadow_version": shadow.get_assignment(request.app.state.pool, name),
     }
+
+
+@app.post("/models/{name}/{version}/canary", dependencies=[Depends(_require_token)])
+def attach_canary(name: str, version: str, request: Request, fraction: float):
+    if not 0 < fraction < 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "fraction must be strictly between 0 and 1; serving everything "
+                "is a promotion, serving nothing is a detach"
+            ),
+        )
+
+    state = request.app.state
+    production = get_production(state.pool, name)
+    if production is None:
+        raise HTTPException(status_code=404, detail=f"no production version for {name}")
+    if production.version == version:
+        raise HTTPException(
+            status_code=409, detail="the production version cannot canary itself"
+        )
+
+    try:
+        model, record = load_version(state.pool, state.store, name, version)
+    except ModelNotFound as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except RegistryError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+    if record.feature_schema != production.feature_schema:
+        raise HTTPException(
+            status_code=409,
+            detail="canary feature schema differs from production; it cannot be served",
+        )
+
+    shadow_cleared = shadow.detach(state.pool, name)
+    if shadow_cleared or getattr(state, "shadow", None) is not None:
+        state.shadow = None
+
+    assignment = canary.attach(
+        state.pool, model_name=name, version=version, fraction=fraction
+    )
+    state.canary = ModelState(
+        name=record.name,
+        version=record.version,
+        model=model,
+        reference_profile=record.reference_profile,
+        reference_sample=record.reference_sample,
+    )
+    state.canary_fraction = fraction
+    return {
+        "model_name": name,
+        "canary_version": record.version,
+        "fraction": assignment["fraction"],
+        "attached_at": assignment["attached_at"].isoformat(),
+        "shadow_cleared": shadow_cleared,
+    }
+
+
+@app.delete("/canary", dependencies=[Depends(_require_token)])
+def detach_canary(request: Request):
+    state = request.app.state
+    name = state.settings.model_name
+    cleared = canary.detach(state.pool, name)
+    state.canary = None
+    state.canary_fraction = None
+    return {"model_name": name, "cleared": cleared}
+
+
+@app.get("/canary")
+def get_canary(request: Request):
+    state = request.app.state
+    name = state.settings.model_name
+    assignment = canary.get_assignment(state.pool, name)
+    return {
+        "model_name": name,
+        "canary_version": assignment["version"] if assignment else None,
+        "fraction": assignment["fraction"] if assignment else None,
+        "attached_at": (
+            assignment["attached_at"].isoformat() if assignment else None
+        ),
+    }
+
+
+@app.get("/canary/report")
+def canary_report(request: Request, window: str = "24h"):
+    try:
+        delta = parse_window(window)
+    except (ValueError, OverflowError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    state = request.app.state
+    name = state.settings.model_name
+    production = get_production(state.pool, name)
+    assignment = canary.get_assignment(state.pool, name)
+    return canary.build_report(
+        state.pool,
+        model_name=name,
+        canary_version=assignment["version"] if assignment else None,
+        production_version=production.version if production else None,
+        fraction=assignment["fraction"] if assignment else None,
+        window=window,
+        since=datetime.now(timezone.utc) - delta,
+        min_samples=state.settings.canary_min_samples,
+    )
 
 
 @app.post("/outcomes", dependencies=[Depends(_require_token)])

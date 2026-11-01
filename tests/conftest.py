@@ -44,7 +44,8 @@ def clean_telemetry_rows(request):
         conn.execute(
             "TRUNCATE prediction_events, quality_checks, observed_outcomes, "
             "drift_checks, incidents, promotion_decisions, "
-            "shadow_predictions, shadow_assignments RESTART IDENTITY"
+            "shadow_predictions, shadow_assignments, canary_assignments "
+            "RESTART IDENTITY"
         )
 
 
