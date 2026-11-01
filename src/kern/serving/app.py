@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from xgboost import XGBRegressor
 
-from kern import canary, evaluation, policy, reports, shadow
+from kern import canary, evaluation, policy, reports, rollback, shadow
 from kern.config import get_settings
 from kern.data.features import build_features
 from kern.registry import (
@@ -232,7 +232,9 @@ async def lifespan(app: FastAPI):
         shadow_writer.start()
 
         if settings.evaluation_interval > 0:
-            runner = evaluation.EvaluationRunner(app)
+            runner = evaluation.EvaluationRunner(
+                app, after_cycle=lambda: run_rollback(app)
+            )
             runner.start()
 
         if not settings.api_token:
@@ -417,6 +419,44 @@ def _predict_with_canary(
             "canary %s failed; falling back to production", canary_state.version
         )
         return current, current.model.predict(features), True
+
+
+def run_rollback(app: FastAPI, *, trigger: str = "automatic") -> dict | None:
+    """Run one rollback attempt and apply a success to this process's state."""
+    state = app.state
+    outcome = rollback.attempt(
+        state.pool,
+        state.store,
+        model_name=state.settings.model_name,
+        trigger=trigger,
+        settings=state.settings,
+    )
+    if outcome is None:
+        return None
+
+    event = outcome["event"]
+    if event["decision"] == "rolled_back":
+        record = outcome["record"]
+        state.current = ModelState(
+            name=record.name,
+            version=record.version,
+            model=outcome["model"],
+            reference_profile=record.reference_profile,
+            reference_sample=record.reference_sample,
+        )
+        if getattr(state, "canary", None) is not None and state.canary.version in (
+            event["from_version"],
+            event["to_version"],
+        ):
+            state.canary = None
+            state.canary_fraction = None
+        if (
+            getattr(state, "shadow", None) is not None
+            and state.shadow.version == event["to_version"]
+        ):
+            state.shadow = None
+
+    return event
 
 
 @app.post("/predict", response_model=PredictionResponse)
@@ -972,7 +1012,41 @@ def list_incidents(request: Request, status: str = "open", limit: int = 100):
 
 @app.post("/evaluate", dependencies=[Depends(_require_token)])
 def evaluate_now(request: Request):
-    return evaluation.run_scheduled(request.app)
+    result = evaluation.run_scheduled(request.app)
+    result["rollback"] = run_rollback(request.app, trigger="automatic")
+    return result
+
+
+@app.post("/rollback", dependencies=[Depends(_require_token)])
+def rollback_now(request: Request):
+    event = run_rollback(request.app, trigger="manual")
+    if event is None:
+        raise HTTPException(
+            status_code=409, detail="no production version to roll back"
+        )
+    if event["decision"] == "refused":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "rollback refused",
+                "reasons": event["reasons"],
+                "event_id": event["id"],
+            },
+        )
+    return event
+
+
+@app.get("/rollbacks")
+def list_rollbacks(request: Request, limit: int = 20):
+    state = request.app.state
+    return {
+        "model_name": state.settings.model_name,
+        "rollbacks": rollback.list_events(
+            state.pool,
+            state.settings.model_name,
+            limit=max(1, min(limit, 100)),
+        ),
+    }
 
 
 @app.get("/shadow/report")

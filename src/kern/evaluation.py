@@ -129,8 +129,9 @@ def run_scheduled(app) -> dict:
 class EvaluationRunner:
     """Background thread that runs one detection cycle per interval."""
 
-    def __init__(self, app):
+    def __init__(self, app, after_cycle=None):
         self._app = app
+        self._after_cycle = after_cycle
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._run, name="kern-evaluation", daemon=True
@@ -150,5 +151,7 @@ class EvaluationRunner:
         while not self._stop.wait(interval):
             try:
                 run_scheduled(self._app)
+                if self._after_cycle is not None:
+                    self._after_cycle()
             except Exception:
                 logger.exception("scheduled evaluation failed")

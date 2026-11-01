@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     shadow_min_samples: int = Field(default=20, ge=1)
     # Paired outcomes required on both sides before /canary/report issues a verdict.
     canary_min_samples: int = Field(default=20, ge=1)
+    # Automated production rollback after a critical performance incident.
+    rollback_enabled: bool = True
+    # Only versions promoted within this many hours are auto-reverted; 0 disables.
+    rollback_max_age_hours: float = Field(default=24.0, ge=0)
+    # Minimum minutes between automatic rollback attempts for a model; 0 disables.
+    rollback_cooldown_minutes: int = Field(default=60, ge=0)
 
 
 @lru_cache(maxsize=1)

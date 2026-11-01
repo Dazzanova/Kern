@@ -16,6 +16,7 @@ EXPECTED_TABLES = {
     "shadow_assignments",
     "shadow_predictions",
     "canary_assignments",
+    "rollback_events",
 }
 
 

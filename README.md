@@ -14,15 +14,14 @@ reduce model incidents while maintaining inference performance.
 - ✅ Phase 1 — Baseline model serving
 - ✅ Phase 2 — Observability core
 - ✅ Phase 3 — Close the loop and drift detection
-- 🚧 Phase 4 — From observation to action (detection loop, promotion gate, shadow evaluation, and canary deployment done)
+- 🚧 Phase 4 — From observation to action (detection loop, promotion gate, shadow evaluation, canary deployment, and automated rollback done)
 
 Phase 2 adds a versioned model registry, per-request telemetry, and data-quality
 monitoring. Phase 3 makes promotion take effect without a restart, records forecast
 outcomes so MAE and RMSE can be reported with explicit coverage, and compares live
-feature distributions against a stored reference sample using PSI and KS. Phase 4a
-runs those checks on a schedule and records breaches as incidents with a lifecycle.
-
-Kern still observes; it does not act on what it observes.
+feature distributions against a stored reference sample using PSI and KS. Phase 4a runs those checks on a schedule and records breaches as incidents with a
+lifecycle. Kern now acts on that evidence, but only within bounded policies: promotion is
+gated, and rollback reverts a recent promotion after a critical performance incident.
 
 ## Batch Inference
 
@@ -81,6 +80,8 @@ uv run uvicorn src.kern.serving.app:app
 | GET | `/canary` | Current canary assignment and fraction |
 | DELETE | `/canary` | Detach the canary |
 | GET | `/canary/report?window=24h` | Served split, fallbacks, and outcome MAE for both versions |
+| POST | `/rollback` | Manually restore the previous production version |
+| GET | `/rollbacks?limit=20` | Recent rollback decisions, including refusals |
 | POST | `/outcomes` | Upsert observed load for a target hour |
 | GET | `/telemetry/summary?window=1h` | Request counts, latency percentiles, dropped events |
 | GET | `/quality/report?window=1h` | Per-feature data-quality checks |
@@ -90,8 +91,8 @@ uv run uvicorn src.kern.serving.app:app
 | POST | `/evaluate` | Run one detection cycle immediately |
 
 `KERN_API_TOKEN`, when set, is required as `Authorization: Bearer <token>` on promotion,
-shadow/canary attach and detach, `/outcomes`, and `/evaluate`. When unset they are open and
-startup logs a warning.
+shadow/canary attach and detach, `/rollback`, `/outcomes`, and `/evaluate`. When unset they
+are open and startup logs a warning.
 
 The detection loop evaluates quality, drift, and performance every
 `KERN_EVALUATION_INTERVAL` seconds (default 300; `0` disables it) and records breaches as
@@ -122,6 +123,17 @@ served. The report compares disjoint samples and needs `KERN_CANARY_MIN_SAMPLES`
 exclusive: attaching one clears the other and reports which. Promoting the canary detaches
 it automatically.
 
+After each detection cycle, an automated rollback check looks for an open critical
+**performance** incident first seen after the current version was promoted. If one exists,
+production is restored to the most recently promoted archived version that loads, matches
+the feature schema, and has never been rolled back from. Quality and drift incidents never
+trigger a rollback: they describe inputs that an older model would also face. Automatic
+attempts are limited to versions promoted within `KERN_ROLLBACK_MAX_AGE_HOURS` (default 24)
+and to one per `KERN_ROLLBACK_COOLDOWN_MINUTES` (default 60), refusals included.
+`KERN_ROLLBACK_ENABLED=false` turns the automation off. Every decision is recorded in
+`rollback_events` and exposed by `GET /rollbacks`; `POST /rollback` performs the same move
+manually.
+
 Batch telemetry carries one feature snapshot for up to 256 rows, so batch predictions do
 not record a `target_ts` and are excluded from `/performance/report`. Drift checks skip
 calendar features (`hour`, `month`, …) because they are deterministic given the target
@@ -144,6 +156,6 @@ tests that need no infrastructure.
 - [ ] Automated retraining
 - [x] Shadow evaluation
 - [x] Canary deployment
-- [ ] Automated rollback
+- [x] Automated rollback
 - [ ] Predictive autoscaling
 - [ ] Reliability benchmarks
