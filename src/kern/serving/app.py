@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from xgboost import XGBRegressor
 
-from kern import canary, evaluation, policy, reports, rollback, shadow
+from kern import canary, evaluation, policy, reports, retraining, rollback, shadow
 from kern.config import get_settings
 from kern.data.features import build_features
 from kern.registry import (
@@ -233,7 +233,7 @@ async def lifespan(app: FastAPI):
 
         if settings.evaluation_interval > 0:
             runner = evaluation.EvaluationRunner(
-                app, after_cycle=lambda: run_rollback(app)
+                app, after_cycle=lambda: run_after_cycle(app)
             )
             runner.start()
 
@@ -457,6 +457,24 @@ def run_rollback(app: FastAPI, *, trigger: str = "automatic") -> dict | None:
             state.shadow = None
 
     return event
+
+
+def run_retraining(app: FastAPI, *, trigger: str = "automatic") -> dict | None:
+    """Run one retraining attempt. Registration never changes serving state."""
+    state = app.state
+    return retraining.attempt(
+        state.pool,
+        state.store,
+        model_name=state.settings.model_name,
+        trigger=trigger,
+        settings=state.settings,
+    )
+
+
+def run_after_cycle(app: FastAPI) -> None:
+    """Post-cycle recovery: restore production first, then learn from the episode."""
+    run_rollback(app, trigger="automatic")
+    run_retraining(app, trigger="automatic")
 
 
 @app.post("/predict", response_model=PredictionResponse)
@@ -1014,6 +1032,7 @@ def list_incidents(request: Request, status: str = "open", limit: int = 100):
 def evaluate_now(request: Request):
     result = evaluation.run_scheduled(request.app)
     result["rollback"] = run_rollback(request.app, trigger="automatic")
+    result["retraining"] = run_retraining(request.app, trigger="automatic")
     return result
 
 
@@ -1042,6 +1061,38 @@ def list_rollbacks(request: Request, limit: int = 20):
     return {
         "model_name": state.settings.model_name,
         "rollbacks": rollback.list_events(
+            state.pool,
+            state.settings.model_name,
+            limit=max(1, min(limit, 100)),
+        ),
+    }
+
+
+@app.post("/retrain", dependencies=[Depends(_require_token)])
+def retrain_now(request: Request):
+    event = run_retraining(request.app, trigger="manual")
+    if event is None:
+        raise HTTPException(
+            status_code=409, detail="no production version to retrain against"
+        )
+    if event["decision"] in ("skipped", "failed"):
+        raise HTTPException(
+            status_code=409 if event["decision"] == "skipped" else 500,
+            detail={
+                "message": f"retraining {event['decision']}",
+                "reasons": event["reasons"],
+                "event_id": event["id"],
+            },
+        )
+    return event
+
+
+@app.get("/retrain/runs")
+def list_retraining_runs(request: Request, limit: int = 20):
+    state = request.app.state
+    return {
+        "model_name": state.settings.model_name,
+        "runs": retraining.list_runs(
             state.pool,
             state.settings.model_name,
             limit=max(1, min(limit, 100)),

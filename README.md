@@ -14,14 +14,15 @@ reduce model incidents while maintaining inference performance.
 - ✅ Phase 1 — Baseline model serving
 - ✅ Phase 2 — Observability core
 - ✅ Phase 3 — Close the loop and drift detection
-- 🚧 Phase 4 — From observation to action (detection loop, promotion gate, shadow evaluation, canary deployment, and automated rollback done)
+- 🚧 Phase 4 — From observation to action (detection loop, promotion gate, shadow evaluation, canary deployment, automated rollback, and automated retraining done)
 
 Phase 2 adds a versioned model registry, per-request telemetry, and data-quality
 monitoring. Phase 3 makes promotion take effect without a restart, records forecast
 outcomes so MAE and RMSE can be reported with explicit coverage, and compares live
 feature distributions against a stored reference sample using PSI and KS. Phase 4a runs those checks on a schedule and records breaches as incidents with a
 lifecycle. Kern now acts on that evidence, but only within bounded policies: promotion is
-gated, and rollback reverts a recent promotion after a critical performance incident.
+gated, rollback reverts a recent promotion after a critical performance incident, and
+retraining turns the same labeled traffic into a new candidate without touching production.
 
 ## Batch Inference
 
@@ -82,6 +83,8 @@ uv run uvicorn src.kern.serving.app:app
 | GET | `/canary/report?window=24h` | Served split, fallbacks, and outcome MAE for both versions |
 | POST | `/rollback` | Manually restore the previous production version |
 | GET | `/rollbacks?limit=20` | Recent rollback decisions, including refusals |
+| POST | `/retrain` | Train and register a candidate from labeled live traffic |
+| GET | `/retrain/runs?limit=20` | Recent retraining decisions, including skips and failures |
 | POST | `/outcomes` | Upsert observed load for a target hour |
 | GET | `/telemetry/summary?window=1h` | Request counts, latency percentiles, dropped events |
 | GET | `/quality/report?window=1h` | Per-feature data-quality checks |
@@ -91,8 +94,8 @@ uv run uvicorn src.kern.serving.app:app
 | POST | `/evaluate` | Run one detection cycle immediately |
 
 `KERN_API_TOKEN`, when set, is required as `Authorization: Bearer <token>` on promotion,
-shadow/canary attach and detach, `/rollback`, `/outcomes`, and `/evaluate`. When unset they
-are open and startup logs a warning.
+shadow/canary attach and detach, `/rollback`, `/retrain`, `/outcomes`, and `/evaluate`. When
+unset they are open and startup logs a warning.
 
 The detection loop evaluates quality, drift, and performance every
 `KERN_EVALUATION_INTERVAL` seconds (default 300; `0` disables it) and records breaches as
@@ -134,6 +137,20 @@ and to one per `KERN_ROLLBACK_COOLDOWN_MINUTES` (default 60), refusals included.
 `rollback_events` and exposed by `GET /rollbacks`; `POST /rollback` performs the same move
 manually.
 
+When a critical performance incident is open, the same post-cycle hook retrains from
+labeled live traffic: forecasts whose target hour is in the past, whose prediction was
+recorded before that hour, and whose outcome has arrived. Duplicate targets keep the latest
+forecast, the newest `KERN_RETRAIN_HOLDOUT_FRACTION` (default 20%) becomes a temporal
+holdout, and the model is registered as an `auto-<timestamp>` candidate. Retraining never
+attaches, canaries, or promotes it; shadow, canary, and the promotion gate still decide
+deployment. Fewer than `KERN_RETRAIN_MIN_ROWS` (default 100) labeled rows in
+`KERN_RETRAIN_WINDOW_DAYS` (default 30) records a skip instead of training.
+`KERN_RETRAIN_COOLDOWN_HOURS` (default 24) limits automatic decisions per model, and
+`KERN_RETRAIN_ENABLED=false` disables automation. Every decision lands in `retraining_runs`
+and is exposed by `GET /retrain/runs`; `POST /retrain` runs the same attempt manually.
+Feature snapshots are sampled at `KERN_FEATURE_SAMPLE_RATE` (default 5%), so deployments
+that retrain regularly should raise it.
+
 Batch telemetry carries one feature snapshot for up to 256 rows, so batch predictions do
 not record a `target_ts` and are excluded from `/performance/report`. Drift checks skip
 calendar features (`hour`, `month`, …) because they are deterministic given the target
@@ -153,7 +170,7 @@ tests that need no infrastructure.
 - [x] Data-quality monitoring
 - [x] Drift detection
 - [x] Candidate training and promotion gate
-- [ ] Automated retraining
+- [x] Automated retraining
 - [x] Shadow evaluation
 - [x] Canary deployment
 - [x] Automated rollback

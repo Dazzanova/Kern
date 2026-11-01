@@ -45,6 +45,16 @@ class Settings(BaseSettings):
     rollback_max_age_hours: float = Field(default=24.0, ge=0)
     # Minimum minutes between automatic rollback attempts for a model; 0 disables.
     rollback_cooldown_minutes: int = Field(default=60, ge=0)
+    # Automated retraining after a critical performance incident.
+    retrain_enabled: bool = True
+    # Labeled rows required before training; fewer is a recorded skip.
+    retrain_min_rows: int = Field(default=100, ge=2)
+    # Days of labeled live traffic to collect.
+    retrain_window_days: int = Field(default=30, ge=1)
+    # Newest share of rows reserved as the temporal holdout.
+    retrain_holdout_fraction: float = Field(default=0.2, gt=0.0, lt=1.0)
+    # Minimum hours between automatic retraining decisions for a model; 0 disables.
+    retrain_cooldown_hours: float = Field(default=24.0, ge=0)
 
 
 @lru_cache(maxsize=1)
