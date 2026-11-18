@@ -56,6 +56,61 @@ Workload: 10,000 records, Concurrency 4, 3 repetitions (median reported).
 
 *Note: Latency refers to the whole HTTP request. Throughput refers to successfully processed prediction records per second. Results are local experimental measurements.*
 
+### Reliability Benchmark
+`benchmarks/reliability.py` measures how long Kern takes to detect and recover from
+three injected faults: out-of-range inputs (quality), a shifted feature distribution
+(drift), and forecasts paired with deliberately wrong outcomes (performance). It drives
+only the public API, so it measures the running detection loop rather than a mock.
+
+Start the API with a short evaluation cycle and full feature sampling, and with automatic
+rollback and retraining disabled so the benchmark controls when production changes:
+
+```bash
+KERN_EVALUATION_INTERVAL=5 \
+KERN_FEATURE_SAMPLE_RATE=1.0 \
+KERN_ROLLBACK_ENABLED=false \
+KERN_RETRAIN_ENABLED=false \
+uv run uvicorn src.kern.serving.app:app
+```
+
+Then run the benchmark with a reset so each scenario starts from an empty window:
+
+```bash
+uv run benchmarks/reliability.py \
+  --reset \
+  --database-url postgresql://kern:kern@localhost:5432/kern
+```
+
+Each scenario records detection time (fault start to the first matching incident) and
+recovery time (fault removal to the incident resolving), plus the number of fault and
+recovery requests. Quality and drift recover by diluting the bad samples with traffic
+drawn from the production model's reference distribution; performance recovers by
+correcting the outcomes. `--reset` truncates telemetry, checks, incidents, outcomes, and
+the other benchmark-owned tables before each scenario; it is for development databases
+only. Without `--reset`, the benchmark refuses to start if quality, drift, or performance
+incidents are already open, and the measurement depends on how quiet the last hour was.
+
+The script refuses to start when a shadow or canary is attached, because those requests
+would be recorded against a non-production version. It writes
+`benchmarks/reliability_results.json` and exits non-zero if a scenario times out.
+
+#### Measured Results
+
+Measurement on Linux 7.0.0-42-generic x86_64, Python 3.12.15, evaluation interval 5s,
+full feature sampling, 2s polling, and `--reset` before each scenario:
+
+| Scenario | Fault requests | Detect | Recovery requests | Recover |
+|---|---:|---:|---:|---:|
+| Quality corruption | 60 | 3.2s | 1,750 | 40.4s |
+| Feature drift | 150 | 5.9s | 4,500 | 94.8s |
+| Performance decay | 30 | 2.6s | 0 (outcome correction) | 4.0s |
+
+Detection is fast because the evaluation loop runs every 5s. Recovery is dominated by
+dilution: an incident clears only when its bad samples fall below the quality threshold
+within the one-hour window, so drift takes longer to recover than it does to detect.
+Performance is different — it recovers as soon as corrected outcomes outweigh the bad
+ones, which took one further evaluation cycle.
+
 ## Observability
 
 Kern versions models in a registry, records per-request telemetry, and compares live
@@ -194,4 +249,4 @@ tests that need no infrastructure.
 - [x] Canary deployment
 - [x] Automated rollback
 - [x] Predictive autoscaling
-- [ ] Reliability benchmarks
+- [x] Reliability benchmarks
